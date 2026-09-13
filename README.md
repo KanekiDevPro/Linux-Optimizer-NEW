@@ -47,5 +47,6 @@ This script safely applies a set of best-practice system tweaks:
    ```bash
    sudo apt update -q && sudo apt install -y sudo wget
 
+.
    ```bash
    wget "https://raw.githubusercontent.com/KanekiDevPro/Linux-Optimizer-NEW/main/linux-optimizer.sh" -O linux-optimizer.sh && chmod +x linux-optimizer.sh && bash linux-optimizer.sh
