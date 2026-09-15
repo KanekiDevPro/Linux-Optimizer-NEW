@@ -49,7 +49,7 @@
 
 set -uo pipefail
 
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.0.4"
 readonly SCRIPT_NAME="$(basename "$0")"
 
 # --- Paths & defaults (overridable via CLI/env) ------------------------------
@@ -111,9 +111,13 @@ backup_file() {
 }
 
 is_container() {
-    # LXC / OpenVZ / Docker have no swap or sysctl write access
+    # LXC / OpenVZ / Docker / Podman / nspawn cannot enable swap from inside
+    # (the host controls it), so swap_maker skips gracefully there.
     if [ -f /.dockerenv ]; then return 0; fi
-    if grep -qa 'container=lxc\|container=docker' /proc/1/environ 2>/dev/null; then return 0; fi
+    if [ -f /run/.containerenv ]; then return 0; fi
+    if [ -n "${container:-}" ]; then return 0; fi
+    if grep -qaE 'container=(lxc|docker|podman|systemd-nspawn)' /proc/1/environ 2>/dev/null; then return 0; fi
+    if grep -qaE 'docker|lxc|kubepods|containerd' /proc/1/cgroup 2>/dev/null; then return 0; fi
     if [ -d /proc/vz ] && [ ! -d /proc/bc ]; then return 0; fi
     if command -v systemd-detect-virt >/dev/null 2>&1; then
         systemd-detect-virt -c -q 2>/dev/null && return 0
@@ -342,13 +346,18 @@ swap_maker() {
     fi
 
     # Idempotent: already-active swap of the right size -> nothing to do.
-    if grep -qs "[[:space:]]${SWAP_PATH}[[:space:]]" /proc/swaps; then
-        local cur_kb want_kb
-        cur_kb=$(awk -v p="$SWAP_PATH" '$1==p {print $3}' /proc/swaps)
-        want_kb=$(swap_size_to_kb "$SWAP_SIZE")
-        if [ -n "$cur_kb" ] && [ -n "$want_kb" ] && [ "$cur_kb" -eq "$want_kb" ] 2>/dev/null \
+    # NOTE: /proc/swaps "Size" excludes the swap header page, so an exact
+    # KB comparison NEVER matches the requested size (2G file shows as
+    # 2097148K, not 2097152K). Compare the backing FILE size instead,
+    # with 1MB tolerance for rounding.
+    if grep -qs "^${SWAP_PATH}[[:space:]]" /proc/swaps; then
+        local cur_bytes="" want_bytes="" diff_bytes=""
+        cur_bytes=$(stat -c %s "$SWAP_PATH" 2>/dev/null || echo 0)
+        want_bytes=$(( $(swap_size_to_mb "$SWAP_SIZE") * 1024 * 1024 ))
+        diff_bytes=$(( ${cur_bytes:-0} - ${want_bytes:-0} ))
+        if [ "${diff_bytes#-}" -le 1048576 ] \
             && grep -qF "$SWAP_PATH" /etc/fstab; then
-            green_msg "Swap $SWAP_PATH already active (${cur_kb}K) with fstab entry. Nothing to do."
+            green_msg "Swap $SWAP_PATH already active (correct size) with fstab entry. Nothing to do."
             echo
             return 0
         fi
@@ -383,11 +392,17 @@ swap_maker() {
         return 1
     fi
 
-    # btrfs/overlayfs: fallocate creates Copy-on-Write holes swapon rejects.
-    local fstype use_dd_only=0
+    # CoW/odd filesystems: fallocate leaves holes swapon rejects
+    # ("swapfile has holes"). dd writes real blocks everywhere.
+    local fstype use_dd_only=0 btrfs_nocow=0
     fstype=$(stat -f -c %T "$swap_dir" 2>/dev/null || echo unknown)
     case "$fstype" in
-        btrfs|overlayfs|aufs|zfs)
+        btrfs)
+            yellow_msg "Filesystem btrfs: using dd + NOCOW (mandatory for swap on btrfs)."
+            use_dd_only=1
+            btrfs_nocow=1
+            ;;
+        overlayfs|aufs|zfs|xfs)
             yellow_msg "Filesystem $fstype does not support fallocate swap, using dd directly."
             use_dd_only=1
             ;;
@@ -405,6 +420,19 @@ swap_maker() {
     if [ "$created_with_fallocate" != true ]; then
         local count
         count=$(swap_size_to_mb "$SWAP_SIZE")
+        if [ "$btrfs_nocow" -eq 1 ]; then
+            # btrfs REQUIRES a fresh NOCOW file: preallocate empty, set the
+            # flag, THEN write data. chattr +C on an existing non-empty file
+            # is a silent no-op, so order matters.
+            rm -f "$SWAP_PATH"
+            touch "$SWAP_PATH"
+            chmod 600 "$SWAP_PATH"
+            if ! chattr +C "$SWAP_PATH" 2>/dev/null; then
+                red_msg "btrfs: cannot set NOCOW on $SWAP_PATH - swap is unsupported on this subvolume (compressed/odd mount?). Leaving NO swap; system runs without it."
+                rm -f "$SWAP_PATH"
+                return 1
+            fi
+        fi
         if ! dd if=/dev/zero of="$SWAP_PATH" bs=1M count="$count" status=none; then
             red_msg "Failed to create swap file via dd"
             rm -f "$SWAP_PATH"
@@ -418,11 +446,16 @@ swap_maker() {
         rm -f "$SWAP_PATH"
         return 1
     fi
-    if ! swapon "$SWAP_PATH" 2>/dev/null; then
+    # Capture swapon stderr: the exact message ("has holes" vs "Operation
+    # not permitted") tells a CoW filesystem apart from a host that forbids
+    # swap. Swallowing it (2>/dev/null) leaves the user guessing.
+    local swapon_err=""
+    if ! swapon_err=$(swapon "$SWAP_PATH" 2>&1); then
         if [ "$created_with_fallocate" = true ]; then
             # Classic failure: fallocate hole-punching on an FS that
             # claims support but rejects swapon. Retry once with dd.
-            yellow_msg "swapon rejected fallocate file (filesystem hole issue). Retrying once with dd..."
+            yellow_msg "swapon rejected fallocate file: ${swapon_err:-unknown error}"
+            yellow_msg "Retrying once with dd (real blocks, no holes)..."
             rm -f "$SWAP_PATH"
             local count2
             count2=$(swap_size_to_mb "$SWAP_SIZE")
@@ -437,13 +470,15 @@ swap_maker() {
                 rm -f "$SWAP_PATH"
                 return 1
             }
-            swapon "$SWAP_PATH" || {
-                red_msg "swapon failed - check dmesg (host may forbid swap)"
+            if ! swapon_err=$(swapon "$SWAP_PATH" 2>&1); then
+                red_msg "swapon failed: ${swapon_err:-unknown error}"
+                red_msg "Host likely forbids swap (container) or FS rejected it. Check dmesg. Continuing without swap."
                 rm -f "$SWAP_PATH"
                 return 1
-            }
+            fi
         else
-            red_msg "swapon failed - check dmesg (host may forbid swap)"
+            red_msg "swapon failed: ${swapon_err:-unknown error}"
+            red_msg "Common causes: container/host forbids swap, or CoW filesystem. Check dmesg."
             rm -f "$SWAP_PATH"
             return 1
         fi
@@ -455,7 +490,7 @@ swap_maker() {
         echo "$SWAP_PATH   none    swap    sw,nofail    0   0" >> /etc/fstab
     fi
 
-    if grep -qs "[[:space:]]${SWAP_PATH}[[:space:]]" /proc/swaps; then
+    if grep -qs "^${SWAP_PATH}[[:space:]]" /proc/swaps; then
         green_msg "SWAP Created & Activated Successfully."
     else
         red_msg "SWAP creation verification failed"
@@ -1224,6 +1259,10 @@ update_sshd_conf() {
     echo
 
     [ -f "$SSH_PATH" ] || { red_msg "SSH config missing, aborting SSH step"; return 1; }
+    if ! command -v sshd >/dev/null 2>&1; then
+        yellow_msg "sshd binary not found (openssh-server not installed). Skipping SSH step."
+        return 0
+    fi
 
     set_sshd_opt() {
         local key="$1" val="$2"
@@ -1257,7 +1296,21 @@ update_sshd_conf() {
     set_sshd_opt "X11Forwarding" "no"
     set_sshd_opt "AllowAgentForwarding" "no"
 
-    if sshd -t 2>/dev/null; then
+    # --- Runtime prerequisites (pristine/minimal cloud images) ---
+    # 1. Privilege-separation directory: absent before the daemon ever
+    #    starts. Without it sshd -t fails for ENVIRONMENT reasons (not a
+    #    config error) and would trigger a bogus rollback. Create it first.
+    mkdir -p -m 0755 /run/sshd 2>/dev/null || true
+    # 2. Host keys: absent when openssh-server was installed but never
+    #    started/configured. sshd -t fails without them.
+    if ! ls /etc/ssh/ssh_host_* >/dev/null 2>&1; then
+        yellow_msg "No SSH host keys found, generating (ssh-keygen -A)..."
+        ssh-keygen -A 2>/dev/null || yellow_msg "Host-key generation unavailable, continuing anyway."
+    fi
+
+    # Capture output: a bare 2>/dev/null hides WHY the test failed.
+    local sshd_out=""
+    if sshd_out=$(sshd -t 2>&1); then
         # reload keeps existing sessions alive; restart would drop yours.
         if systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null; then
             green_msg 'SSH is Optimized (reloaded, sessions preserved).'
@@ -1266,14 +1319,15 @@ update_sshd_conf() {
             yellow_msg 'Apply manually when ready: systemctl restart ssh'
         fi
     else
-        red_msg 'sshd -t failed - restoring backup to avoid lockout.'
+        red_msg 'sshd -t failed:'
+        printf '%s\n' "$sshd_out" >&2
+        red_msg 'Restoring backup to avoid lockout.'
         local latest
         latest=$(ls -1t "${SSH_PATH}".bak.* 2>/dev/null | head -n1)
         if [ -n "$latest" ]; then
             cp -p "$latest" "$SSH_PATH"
             yellow_msg "Restored: $latest"
         fi
-        sshd -t || true
         return 1
     fi
     echo
