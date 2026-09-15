@@ -1514,7 +1514,16 @@ get_effective_dns() {
     case "$METHOD" in
         systemd-resolved)
             if command -v resolvectl >/dev/null 2>&1; then
-                LC_ALL=C resolvectl dns 2>/dev/null | sed -E 's/^[^:]*:[[:space:]]*//' | tr ' ' '\n'
+                # `resolvectl dns` line-wraps a long server list with a hanging
+                # indent and does NOT repeat the "Global:"/"Link N (dev):" label
+                # on continuation lines. A naive "strip up to the first colon"
+                # then mistakes an IPv6 address's leading hextet (e.g. "2606:")
+                # for a label and chops it off. Only strip an actual label.
+                # SYSTEMD_COLUMNS widens the table so wrapping is rare in the
+                # first place; the regex is the real fix and works either way.
+                LC_ALL=C SYSTEMD_COLUMNS=1000 COLUMNS=1000 resolvectl dns 2>/dev/null \
+                    | sed -E 's/^[[:space:]]*(Global|Link [0-9]+ \([^)]*\)):[[:space:]]*//' \
+                    | tr ' ' '\n'
             fi
             ;;
         networkmanager)
