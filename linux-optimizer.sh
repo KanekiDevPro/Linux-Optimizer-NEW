@@ -1793,6 +1793,29 @@ fix_dns() {
     plain_msg ""
     yellow_msg "DNS configuration."
 
+    # Idempotency skip-check: a previous run already owns DNS and it is
+    # healthy, so do not force menu selection again unless --dns=N was given.
+    if [ -z "$OPT_DNS_CHOICE" ] && [ -f "$DNS_STATE_FILE" ] && system_dns_works; then
+        # shellcheck disable=SC1090
+        . "$DNS_STATE_FILE" 2>/dev/null || true
+        green_msg "DNS is already configured by Linux-Optimizer (${OPT_DNS_ALL:-active})."
+        if [ "$OPT_ASSUME_YES" = "1" ]; then
+            green_msg "Keeping the existing DNS configuration (--yes)."
+            return 0
+        fi
+        local _keep=""
+        read_input _keep "[*] Keep existing DNS configuration and skip this stage? [Y/n]: " || _keep=""
+        case "$_keep" in
+            ""|y|Y|yes|YES|Yes)
+                green_msg "Keeping current DNS. Skipping DNS stage."
+                return 0
+                ;;
+            *)
+                yellow_msg "Reconfiguring DNS..."
+                ;;
+        esac
+    fi
+
     init_ip_validator
     choose_dns || return 1
     parse_dns_choice || return 1
