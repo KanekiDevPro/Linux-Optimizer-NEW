@@ -134,9 +134,9 @@ installations() {
 
     packages=(
         apt-transport-https
-        apt-utils bash-completion busybox ca-certificates cron curl gnupg2 locales lsb-release nano preload screen software-properties-common ufw unzip vim wget xxd zip
-        autoconf automake build-essential git libtool make pkg-config python3 python3-pip
-        bc binutils binutils-common binutils-x86-64-linux-gnu ubuntu-keyring haveged jq libsodium-dev libsqlite3-dev libssl-dev packagekit qrencode socat
+        apt-utils bash-completion busybox ca-certificates cron curl gnupg2 locales lsb-release nano screen software-properties-common unzip vim wget xxd zip
+        git pkg-config python3 python3-pip
+        bc binutils binutils-common binutils-x86-64-linux-gnu ubuntu-keyring jq libsodium-dev libsqlite3-dev libssl-dev packagekit qrencode socat
         dialog htop net-tools
     )
 
@@ -163,7 +163,7 @@ installations() {
 
 # Enable packages at server boot
 enable_packages() {
-    for svc in cron haveged preload; do
+    for svc in cron; do
         if systemctl list-unit-files 2>/dev/null | grep -q "^${svc}.service"; then
             systemctl enable "$svc" 2>/dev/null || true
         fi
@@ -208,7 +208,7 @@ swap_maker() {
     swap_dir=$(dirname "$SWAP_PATH")
     [ -d "$swap_dir" ] || swap_dir="/"
     avail_mb=$(df -m --output=avail "$swap_dir" 2>/dev/null | tail -n1 | tr -d ' ')
-    
+
     case "$SWAP_SIZE" in
         *G|*g) swap_mb=$((${SWAP_SIZE%[Gg]} * 1024)) ;;
         *M|*m) swap_mb=${SWAP_SIZE%[Mm]} ;;
@@ -283,7 +283,7 @@ sysctl_optimizations() {
     local QDISC="fq_codel"
     local timestamp
     timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date +"%Y-%m-%d %H:%M:%S")
-    
+
     detect_ram_gb() {
         local mem_kb
         mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null)
@@ -299,7 +299,7 @@ sysctl_optimizations() {
         fi
         echo "unknown"
     }
-    
+
     detect_cpu_cores() {
         if command -v nproc >/dev/null 2>&1; then
             nproc 2>/dev/null || echo "1"
@@ -307,7 +307,7 @@ sysctl_optimizations() {
             grep -c ^processor /proc/cpuinfo 2>/dev/null || echo "1"
         fi
     }
-    
+
     detect_primary_iface() {
         local _iface=""
         if command -v ip >/dev/null 2>&1; then
@@ -326,7 +326,7 @@ sysctl_optimizations() {
         [ -z "$_iface" ] && _iface="unknown"
         echo "$_iface"
     }
-    
+
     detect_link_speed() {
         local _iface="$1"
         local _speed="unknown"
@@ -363,7 +363,7 @@ sysctl_optimizations() {
         fi
         echo "$_speed"
     }
-    
+
     if [ -n "$profile_input" ]; then
         case "$profile_input" in
             balanced|vpn-high-throughput|vpn-low-latency|conservative|auto)
@@ -405,12 +405,12 @@ sysctl_optimizations() {
             profile="balanced"
         fi
     fi
-    
+
     ram_gb=$(detect_ram_gb)
     cpu_cores=$(detect_cpu_cores)
     iface=$(detect_primary_iface)
     speed=$(detect_link_speed "$iface")
-    
+
     local ram_gb_num=2
     if [[ "$ram_gb" =~ ^[0-9]+$ ]]; then
         ram_gb_num="$ram_gb"
@@ -419,7 +419,7 @@ sysctl_optimizations() {
     if [[ "$cpu_cores" =~ ^[0-9]+$ ]]; then
         cpu_cores_num="$cpu_cores"
     fi
-    
+
     if [ "$profile" = "auto" ]; then
         if [[ "$ram_gb" =~ ^[0-9]+$ ]] && [ "$ram_gb" -ge 8 ] && [ "$cpu_cores_num" -ge 4 ]; then
             selected_profile="vpn-high-throughput"
@@ -447,18 +447,18 @@ sysctl_optimizations() {
     else
         selected_profile="$profile"
     fi
-    
+
     echo
     yellow_msg "Optimizing Network via sysctl (profile: $selected_profile)..."
     echo
     sleep 0.5
-    
+
     if [ -f "$SYS_PATH" ]; then
         _backup_dest="/etc/sysctl.conf.bak.$(date +%F-%H%M%S)"
         [ -f "$_backup_dest" ] || cp "$SYS_PATH" "$_backup_dest" 2>/dev/null || cp "$SYS_PATH" "/etc/sysctl.conf.bak" 2>/dev/null || true
         green_msg "Backup of sysctl.conf created."
     fi
-    
+
     TCP_CC="bbr"
     if ! sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
         modprobe tcp_bbr 2>/dev/null || true
@@ -467,7 +467,7 @@ sysctl_optimizations() {
             TCP_CC="cubic"
         fi
     fi
-    
+
     QDISC="fq_codel"
     local _qdisc_iface="$iface"
     if [ -z "$_qdisc_iface" ] || [ "$_qdisc_iface" = "unknown" ]; then
@@ -502,7 +502,7 @@ sysctl_optimizations() {
     else
         QDISC="fq_codel"
     fi
-    
+
     local tcp_mem=""
     local udp_mem=""
     local min_free_kbytes=""
@@ -570,12 +570,12 @@ sysctl_optimizations() {
             min_free_kbytes="16384"
             ;;
     esac
-    
+
     local busy_poll_supported=0
     if sysctl -n net.core.busy_poll >/dev/null 2>&1; then
         busy_poll_supported=1
     fi
-    
+
     local header_info
     header_info="# Generated: $timestamp
 # Selected profile: $selected_profile
@@ -589,7 +589,7 @@ sysctl_optimizations() {
 # QDISC: $QDISC
 # RAM-aware tcp_mem: ${tcp_mem:-not set (conservative)}
 # Host: $(hostname 2>/dev/null || echo unknown) Kernel: $(uname -r 2>/dev/null || echo unknown)"
-    
+
     case "$selected_profile" in
         balanced)
             cat > "$SYS_OPTIMIZER_PATH" <<EOF
@@ -642,6 +642,8 @@ net.ipv4.tcp_ecn = 1
 net.ipv4.tcp_ecn_fallback = 1
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.ip_local_port_range = 1024 65535
 
 # UDP - balanced
 net.ipv4.udp_mem = $udp_mem
@@ -721,6 +723,8 @@ net.ipv4.tcp_ecn = 1
 net.ipv4.tcp_ecn_fallback = 1
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.ip_local_port_range = 1024 65535
 
 # UDP - high throughput
 net.ipv4.udp_mem = $udp_mem
@@ -800,6 +804,8 @@ net.ipv4.tcp_ecn = 1
 net.ipv4.tcp_ecn_fallback = 1
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.ip_local_port_range = 1024 65535
 
 # UDP - low latency
 net.ipv4.udp_mem = $udp_mem
@@ -892,12 +898,12 @@ kernel.panic = 1
 EOF
             ;;
     esac
-    
+
     if [ ! -s "$SYS_OPTIMIZER_PATH" ]; then
         red_msg "Generated sysctl config is empty!"
         return 1
     fi
-    
+
     local dup_keys
     dup_keys=$(grep -v "^#" "$SYS_OPTIMIZER_PATH" | grep -v "^$" | cut -d= -f1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sort | uniq -d)
     if [ -n "$dup_keys" ]; then
@@ -905,21 +911,21 @@ EOF
         echo "$dup_keys"
         return 1
     fi
-    
+
     if grep -q "99-optimizer" "$SYS_PATH" 2>/dev/null; then
         sed -i '/99-optimizer/d' "$SYS_PATH"
     fi
-    
-    for key in fs.file-max net.ipv4.ip_forward net.ipv6.conf.all.forwarding net.core.default_qdisc net.core.netdev_max_backlog net.core.optmem_max net.core.somaxconn net.core.rmem_max net.core.wmem_max net.core.rmem_default net.core.wmem_default net.core.busy_poll net.core.busy_read net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_congestion_control net.ipv4.tcp_fin_timeout net.ipv4.tcp_keepalive_time net.ipv4.tcp_keepalive_probes net.ipv4.tcp_keepalive_intvl net.ipv4.tcp_max_orphans net.ipv4.tcp_max_syn_backlog net.ipv4.tcp_max_tw_buckets net.ipv4.tcp_mem net.ipv4.tcp_mtu_probing net.ipv4.tcp_notsent_lowat net.ipv4.tcp_retries2 net.ipv4.tcp_sack net.ipv4.tcp_dsack net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_window_scaling net.ipv4.tcp_adv_win_scale net.ipv4.tcp_ecn net.ipv4.tcp_ecn_fallback net.ipv4.tcp_syncookies net.ipv4.tcp_fastopen net.ipv4.udp_mem net.unix.max_dgram_qlen vm.min_free_kbytes vm.swappiness vm.vfs_cache_pressure net.ipv4.conf.default.rp_filter net.ipv4.conf.all.rp_filter net.ipv4.conf.all.accept_source_route net.ipv4.conf.default.accept_source_route net.ipv4.neigh.default.gc_thresh1 net.ipv4.neigh.default.gc_thresh2 net.ipv4.neigh.default.gc_thresh3 net.ipv4.neigh.default.gc_stale_time kernel.panic vm.dirty_ratio vm.overcommit_memory vm.overcommit_ratio; do
+
+    for key in fs.file-max net.ipv4.ip_forward net.ipv6.conf.all.forwarding net.core.default_qdisc net.core.netdev_max_backlog net.core.optmem_max net.core.somaxconn net.core.rmem_max net.core.wmem_max net.core.rmem_default net.core.wmem_default net.core.busy_poll net.core.busy_read net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_congestion_control net.ipv4.tcp_fin_timeout net.ipv4.tcp_keepalive_time net.ipv4.tcp_keepalive_probes net.ipv4.tcp_keepalive_intvl net.ipv4.tcp_max_orphans net.ipv4.tcp_max_syn_backlog net.ipv4.tcp_max_tw_buckets net.ipv4.tcp_mem net.ipv4.tcp_mtu_probing net.ipv4.tcp_notsent_lowat net.ipv4.tcp_retries2 net.ipv4.tcp_sack net.ipv4.tcp_dsack net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_window_scaling net.ipv4.tcp_adv_win_scale net.ipv4.tcp_ecn net.ipv4.tcp_ecn_fallback net.ipv4.tcp_syncookies net.ipv4.tcp_fastopen net.ipv4.tcp_tw_reuse net.ipv4.ip_local_port_range net.ipv4.udp_mem net.unix.max_dgram_qlen vm.min_free_kbytes vm.swappiness vm.vfs_cache_pressure net.ipv4.conf.default.rp_filter net.ipv4.conf.all.rp_filter net.ipv4.conf.all.accept_source_route net.ipv4.conf.default.accept_source_route net.ipv4.neigh.default.gc_thresh1 net.ipv4.neigh.default.gc_thresh2 net.ipv4.neigh.default.gc_thresh3 net.ipv4.neigh.default.gc_stale_time kernel.panic vm.dirty_ratio vm.overcommit_memory vm.overcommit_ratio; do
         if grep -q "^${key}[[:space:]]*=" "$SYS_PATH" 2>/dev/null; then
             if grep -q "^${key}[[:space:]]*=" "$SYS_OPTIMIZER_PATH" 2>/dev/null; then
                 sed -i "/^${key//./\\.}[[:space:]]*=/d" "$SYS_PATH"
             fi
         fi
     done
-    
+
     chmod 644 "$SYS_OPTIMIZER_PATH"
-    
+
     echo
     yellow_msg "Applying sysctl settings (profile: $selected_profile)..."
     local apply_log
@@ -956,40 +962,11 @@ EOF
         rm -f "$p_log"
     fi
     rm -f "$apply_log"
-    
+
     echo
     green_msg "Network is Optimized (profile: $selected_profile). Config: $SYS_OPTIMIZER_PATH"
     echo
     sleep 0.5
-}
-
-# Find SSH port
-find_ssh_port() {
-    echo
-    yellow_msg "Finding SSH port..."
-    echo
-
-    SSH_PORT=""
-    if command -v sshd >/dev/null 2>&1; then
-        detected=$(sshd -T 2>/dev/null | awk '/^port / {print $2}' | tail -n1)
-        [ -n "$detected" ] && SSH_PORT="$detected"
-    fi
-    if [ -z "$SSH_PORT" ] && [ -e "$SSH_PATH" ]; then
-        SSH_PORT=$(grep -E "^\s*Port\s+[0-9]+" "$SSH_PATH" 2>/dev/null | awk '{print $2}' | tail -n1)
-    fi
-
-    if [ -n "$SSH_PORT" ]; then
-        echo
-        green_msg "SSH port found: $SSH_PORT"
-        echo
-        sleep 0.5
-    else
-        echo
-        green_msg "SSH port is default 22."
-        echo
-        SSH_PORT=22
-        sleep 0.5
-    fi
 }
 
 # Remove old SSH config
@@ -1163,86 +1140,24 @@ EOF
     sleep 0.5
 }
 
-# UFW Optimizations
-ufw_optimizations() {
-    echo
-    yellow_msg 'Installing & Optimizing UFW...'
-    echo
-    sleep 0.5
-
-    if dpkg -l | grep -q firewalld 2>/dev/null; then
-        yellow_msg "firewalld detected, purging to avoid conflict with UFW..."
-        apt-get -y purge firewalld 2>/dev/null || true
-    fi
-
-    apt_update_once || yellow_msg "package list update had warnings, continuing..."
-    apt-get install -y ufw 2>/dev/null || {
-        red_msg "UFW install failed"
-        return 1
-    }
-
-    if [ -z "$SSH_PORT" ]; then
-        find_ssh_port
-    fi
-    if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || [ "$SSH_PORT" -lt 1 ] || [ "$SSH_PORT" -gt 65535 ]; then
-        red_msg "Invalid SSH port detected: $SSH_PORT, defaulting to 22"
-        SSH_PORT=22
-    fi
-
-    ufw --force disable 2>/dev/null || true
-
-    ufw delete allow "$SSH_PORT" 2>/dev/null || true
-    ufw delete allow "$SSH_PORT/tcp" 2>/dev/null || true
-
-    ufw allow "$SSH_PORT/tcp" comment 'SSH' 2>/dev/null || ufw allow "$SSH_PORT"
-    ufw allow 80/tcp comment 'HTTP' 2>/dev/null || ufw allow 80/tcp
-    ufw allow 443/tcp comment 'HTTPS' 2>/dev/null || ufw allow 443/tcp
-
-    ufw delete allow 80/udp 2>/dev/null || true
-    ufw delete allow 443/udp 2>/dev/null || true
-
-    sleep 0.5
-
-    # FIX: Allow routed traffic through UFW for VPNs, Tunnels and Docker
-    if [ -f /etc/default/ufw ]; then
-        sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/g' /etc/default/ufw
-    fi
-
-    ufw default deny incoming 2>/dev/null || true
-    ufw default allow outgoing 2>/dev/null || true
-
-    echo "y" | ufw --force enable 2>/dev/null || ufw --force enable
-    ufw reload 2>/dev/null || true
-
-    ufw status verbose 2>/dev/null || ufw status
-
-    echo
-    green_msg 'UFW is Installed & Optimized. (Only TCP 80,443 + SSH:'"$SSH_PORT"'/tcp opened. Forwarding enabled.)'
-    echo
-    sleep 0.5
-}
-
 # Show Menu
 show_menu() {
     echo
     yellow_msg 'Choose One Option: '
     echo
-    green_msg '1  - Apply Everything (Update + Packages + SWAP + Network + SSH + Limits + UFW) (RECOMMENDED)'
+    green_msg '1  - Apply Everything (Update + Packages + SWAP + Network + SSH + Limits) (RECOMMENDED)'
     echo
-    green_msg '2  - Complete Update + Useful Packages + Make SWAP + Optimize Network, SSH & System Limits + UFW'
-    green_msg '3  - Complete Update + Make SWAP + Optimize Network, SSH & System Limits + UFW'
-    green_msg '4  - Complete Update + Make SWAP + Optimize Network, SSH & System Limits'
+    green_msg '2  - Complete Update + Useful Packages + Make SWAP + Optimize Network, SSH & System Limits'
+    green_msg '3  - Complete Update + Make SWAP + Optimize Network, SSH & System Limits'
     echo
-    green_msg '5  - Complete Update & Clean the OS.'
-    green_msg '6  - Install Useful Packages.'
-    green_msg '7  - Make SWAP (2Gb).'
-    green_msg '8  - Optimize the Network, SSH & System Limits.'
+    green_msg '4  - Complete Update & Clean the OS.'
+    green_msg '5  - Install Useful Packages.'
+    green_msg '6  - Make SWAP (2Gb).'
+    green_msg '7  - Optimize the Network, SSH & System Limits.'
     echo
-    green_msg '9  - Optimize the Network settings.'
-    green_msg '10 - Optimize the SSH settings.'
-    green_msg '11 - Optimize the System Limits.'
-    echo
-    green_msg '12 - Install & Optimize UFW (TCP only).'
+    green_msg '8  - Optimize the Network settings.'
+    green_msg '9  - Optimize the SSH settings.'
+    green_msg '10 - Optimize the System Limits.'
     echo
     red_msg 'q - Exit.'
     echo
@@ -1278,9 +1193,6 @@ main() {
             sleep 0.5
             limits_optimizations
             sleep 0.5
-            find_ssh_port
-            ufw_optimizations
-            sleep 0.5
             echo
             green_msg '========================='
             green_msg  'Done.'
@@ -1300,9 +1212,6 @@ main() {
             sleep 0.5
             limits_optimizations
             sleep 0.5
-            find_ssh_port
-            ufw_optimizations
-            sleep 0.5
             echo
             green_msg '========================='
             green_msg  'Done.'
@@ -1312,16 +1221,6 @@ main() {
         4)
             complete_update
             sleep 0.5
-            swap_maker
-            sleep 0.5
-            sysctl_optimizations
-            sleep 0.5
-            remove_old_ssh_conf
-            sleep 0.5
-            update_sshd_conf
-            sleep 0.5
-            limits_optimizations
-            sleep 0.5
             echo
             green_msg '========================='
             green_msg  'Done.'
@@ -1329,15 +1228,6 @@ main() {
             ask_reboot
             ;;
         5)
-            complete_update
-            sleep 0.5
-            echo
-            green_msg '========================='
-            green_msg  'Done.'
-            green_msg '========================='
-            ask_reboot
-            ;;
-        6)
             complete_update
             sleep 0.5
             installations
@@ -1349,8 +1239,23 @@ main() {
             green_msg '========================='
             ask_reboot
             ;;
-        7)
+        6)
             swap_maker
+            sleep 0.5
+            echo
+            green_msg '========================='
+            green_msg  'Done.'
+            green_msg '========================='
+            ask_reboot
+            ;;
+        7)
+            sysctl_optimizations
+            sleep 0.5
+            remove_old_ssh_conf
+            sleep 0.5
+            update_sshd_conf
+            sleep 0.5
+            limits_optimizations
             sleep 0.5
             echo
             green_msg '========================='
@@ -1361,20 +1266,15 @@ main() {
         8)
             sysctl_optimizations
             sleep 0.5
-            remove_old_ssh_conf
-            sleep 0.5
-            update_sshd_conf
-            sleep 0.5
-            limits_optimizations
-            sleep 0.5
             echo
             green_msg '========================='
             green_msg  'Done.'
             green_msg '========================='
-            ask_reboot
             ;;
         9)
-            sysctl_optimizations
+            remove_old_ssh_conf
+            sleep 0.5
+            update_sshd_conf
             sleep 0.5
             echo
             green_msg '========================='
@@ -1382,16 +1282,6 @@ main() {
             green_msg '========================='
             ;;
         10)
-            remove_old_ssh_conf
-            sleep 0.5
-            update_sshd_conf
-            sleep 0.5
-            echo
-            green_msg '========================='
-            green_msg  'Done.'
-            green_msg '========================='
-            ;;
-        11)
             limits_optimizations
             sleep 0.5
             echo
@@ -1399,15 +1289,6 @@ main() {
             green_msg  'Done.'
             green_msg '========================='
             ask_reboot
-            ;;
-        12)
-            find_ssh_port
-            ufw_optimizations
-            sleep 0.5
-            echo
-            green_msg '========================='
-            green_msg  'Done.'
-            green_msg '========================='
             ;;
         q|Q)
             exit 0
@@ -1437,9 +1318,6 @@ apply_everything() {
     update_sshd_conf
     sleep 0.5
     limits_optimizations
-    sleep 0.5
-    find_ssh_port
-    ufw_optimizations
     sleep 0.5
 }
 
