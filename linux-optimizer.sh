@@ -59,7 +59,7 @@ OPT_ALLOW_UNVERIFIED="${OPT_ALLOW_UNVERIFIED:-0}"
 EXIT_CODE=0
 
 print_usage() {
-    cat <<'USAGE'
+    cat >&2 <<'USAGE'
 Usage: sudo bash linux-optimizer.sh [options]
   --dns=N               DNS preset 1-15 (same as the menu), non-interactive
   --dns-v4="A B"        IPv4 servers (required with --dns=15 --yes)
@@ -158,12 +158,18 @@ _pick_lock_path() {
 }
 
 LOCK_FILE=$(_pick_lock_path)
+LOCK_DIR="${LOCK_FILE}.d"
 if command -v flock >/dev/null 2>&1; then
     exec 9>>"$LOCK_FILE"
     if ! flock -n 9; then
         red_msg "Another instance is running (lock: $LOCK_FILE). Exiting."
-        exit 75
+        exit 72
     fi
+elif ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    # Atomic fallback for minimal systems without flock(1): mkdir is atomic,
+    # so exactly one instance wins the lock.
+    red_msg "Another instance is running (lock: $LOCK_DIR). Exiting."
+    exit 72
 fi
 
 # ---------------------------------------------------------------------------
@@ -236,6 +242,9 @@ TMP_WORKDIR=""
 # ---------------------------------------------------------------------------
 cleanup_tmp() {
     [ -n "$TMP_WORKDIR" ] && [ -d "$TMP_WORKDIR" ] && rm -rf "$TMP_WORKDIR"
+    # rmdir only removes an empty directory, so this never deletes state owned
+    # by another process; it just releases the mkdir fallback lock of this run.
+    [ -n "$LOCK_DIR" ] && [ -d "$LOCK_DIR" ] && rmdir "$LOCK_DIR" 2>/dev/null
     return 0
 }
 
@@ -296,7 +305,7 @@ plain_msg ""
 check_if_running_as_root() {
     if [ "${EUID:-$(id -u)}" -ne 0 ]; then
         red_msg 'Error: You must run this script as root!'
-        exit 77
+        exit 80
     fi
 }
 
@@ -1865,7 +1874,7 @@ valid_tz() {
     [ -n "$tz" ] || return 1
     case "$tz" in *..*|/*|*' '*) return 1 ;; esac
     [ -f "/usr/share/zoneinfo/$tz" ] && return 0
-    LC_ALL=C timedatectl list-timezones 2>/dev/null | grep -Fxq "$tz" && return 0
+    LC_ALL=C timedatectl list-timezones 2>/dev/null | grep -Fxq -- "$tz" && return 0
     return 1
 }
 
@@ -2028,7 +2037,7 @@ detect_os() {
         centos)    yellow_msg "Detected OS: CentOS ${OS_VERSION_ID:-(unknown version)}" ;;
         almalinux) yellow_msg "Detected OS: AlmaLinux/RHEL-compatible ${OS_VERSION_ID:-(unknown version)}" ;;
         fedora)    yellow_msg "Detected OS: Fedora ${OS_VERSION_ID:-(unknown version)}" ;;
-        *)         red_msg "Unsupported or unknown OS."; exit 78 ;;
+        *)         red_msg "Unsupported or unknown OS."; exit 88 ;;
     esac
     return 0
 }
