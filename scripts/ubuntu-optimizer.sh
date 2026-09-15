@@ -49,7 +49,7 @@
 
 set -uo pipefail
 
-readonly SCRIPT_VERSION="2.0.4"
+readonly SCRIPT_VERSION="2.0.5"
 readonly SCRIPT_NAME="$(basename "$0")"
 
 # --- Paths & defaults (overridable via CLI/env) ------------------------------
@@ -57,22 +57,132 @@ SYS_PATH="/etc/sysctl.conf"
 SYS_OPTIMIZER_PATH="/etc/sysctl.d/99-optimizer.conf"
 PROF_PATH="/etc/profile"
 SSH_PATH="/etc/ssh/sshd_config"
+SSH_DROPIN_PATH="/etc/ssh/sshd_config.d/00-optimizer.conf"
+SSH_DROPIN_LEGACY="/etc/ssh/sshd_config.d/99-optimizer.conf"
+SSH_USE_DROPIN=0
+SSH_MAIN_SNAP=""
+SSH_DROPIN_SNAP=""
+SSH_DROPIN_LEGACY_SNAP=""
+BACKUP_LAST=""
 SWAP_PATH="/swapfile"
 SWAP_SIZE="${SWAP_SIZE:-2G}"
 LIMITS_CONF="/etc/security/limits.d/99-optimizer.conf"
 APT_UPDATED=0
 ASSUME_YES=0
 BACKUP_KEEP=5
+FAILED_STEPS=()
 
 # --- Temp-file tracking -------------------------------------------------------
 OPT_TMPFILES=()
-cleanup_tmp() { rm -f "${OPT_TMPFILES[@]:-}" 2>/dev/null || true; }
+cleanup_tmp() { rm -f "${OPT_TMPFILES[@]:-}" 2>/dev/null || true; release_lock 2>/dev/null || true; }
 trap cleanup_tmp EXIT
 new_tmp() {
     local f
     f="$(mktemp)" || return 1
     OPT_TMPFILES+=("$f")
     printf '%s' "$f"
+}
+
+# --- Failure tracking ---------------------------------------------------------
+# Pipelines stay resilient (a failed stage does not abort the rest), but the
+# FINAL status is always honest: any recorded failure suppresses "Done".
+reset_failures() { FAILED_STEPS=(); }
+
+record_failure() {
+    # record_failure <step-name>
+    FAILED_STEPS+=("${1:-unknown}")
+    return 0
+}
+
+run_step() {
+    # run_step <step-name> <command...>: run it, record on failure, never abort.
+    local step="$1"; shift
+    if "$@"; then
+        return 0
+    fi
+    record_failure "$step"
+    return 1
+}
+
+report_failures() {
+    # report_failures: summarize recorded failures; return 1 if any exist.
+    if [ "${#FAILED_STEPS[@]}" -eq 0 ]; then
+        return 0
+    fi
+    red_msg "FAILED stages (${#FAILED_STEPS[@]}): ${FAILED_STEPS[*]}"
+    return 1
+}
+
+print_final_status() {
+    # print_final_status: honest tail banner for pipelines (replaces a blind
+    # "Done" that would also print after failures).
+    if [ "${#FAILED_STEPS[@]}" -eq 0 ]; then
+        echo
+        green_msg '========================='
+        green_msg 'Done.'
+        green_msg '========================='
+        return 0
+    fi
+    echo
+    red_msg '========================='
+    red_msg "Completed WITH FAILURES: ${FAILED_STEPS[*]}"
+    red_msg '========================='
+    return 1
+}
+
+# require_arg_value <option> <candidate>: guard for options expecting a value.
+require_arg_value() {
+    local opt="$1" val="${2:-}"
+    if [ -z "$val" ]; then
+        red_msg "Missing value for $opt."
+        return 1
+    fi
+    case "$val" in
+        --*)
+            red_msg "Missing value for $opt (got another option: $val)."
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+# --- Concurrency protection ---------------------------------------------------
+# A second simultaneous invocation must fail cleanly instead of interleaving
+# fstab/sshd/sysctl edits and backup rotation with the first run.
+OPT_LOCK_FILE=""
+OPT_LOCK_DIR=""
+acquire_lock() {
+    local d
+    for d in /run/lock /var/lock /tmp; do
+        if [ -d "$d" ] && [ -w "$d" ] 2>/dev/null; then
+            OPT_LOCK_FILE="$d/linux-optimizer.lock"
+            break
+        fi
+    done
+    [ -n "$OPT_LOCK_FILE" ] || OPT_LOCK_FILE="/tmp/linux-optimizer.lock"
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>"$OPT_LOCK_FILE" 2>/dev/null || {
+            red_msg "Cannot open lock file $OPT_LOCK_FILE."
+            return 1
+        }
+        if ! flock -n 9 2>/dev/null; then
+            red_msg "Another instance is already running (lock: $OPT_LOCK_FILE). Exiting."
+            return 1
+        fi
+        return 0
+    fi
+    # Fallback for minimal systems without flock(1): mkdir is atomic.
+    OPT_LOCK_DIR="${OPT_LOCK_FILE}.d"
+    if ! mkdir "$OPT_LOCK_DIR" 2>/dev/null; then
+        red_msg "Another instance is already running (lock: $OPT_LOCK_DIR). Exiting."
+        return 1
+    fi
+    return 0
+}
+
+release_lock() {
+    [ -n "${OPT_LOCK_DIR:-}" ] && [ -d "$OPT_LOCK_DIR" ] && rmdir "$OPT_LOCK_DIR" 2>/dev/null
+    return 0
 }
 
 # --- Logging ------------------------------------------------------------------
@@ -98,12 +208,22 @@ red_msg() {
 }
 
 # --- Helpers ------------------------------------------------------------------
+# Per-run unique suffix so two backups of the same file (even within one
+# second, even from concurrent runs) can never share a filename.
+RUN_STAMP="$(date +%Y%m%d-%H%M%S 2>/dev/null || echo norun)-$$"
+BACKUP_SEQ=0
 backup_file() {
-    # backup_file <path> : timestamped copy, rotate to BACKUP_KEEP newest
-    local src="$1" dst
+    # backup_file <path> : timestamped copy, rotate to BACKUP_KEEP newest.
+    # Sets BACKUP_LAST to the exact path created (empty if source missing).
+    local src="$1" dst nanos
+    BACKUP_LAST=""
     [ -f "$src" ] || return 0
-    dst="${src}.bak.$(date +%F-%H%M%S)"
+    nanos=$(date +%N 2>/dev/null || echo "$RANDOM")
+    case "$nanos" in ''|*[!0-9]*) nanos="$RANDOM" ;; esac
+    BACKUP_SEQ=$((BACKUP_SEQ + 1))
+    dst="${src}.bak.$(date +%F-%H%M%S)-${RUN_STAMP}-${nanos}-${BACKUP_SEQ}-$$"
     cp -p "$src" "$dst" 2>/dev/null || return 1
+    BACKUP_LAST="$dst"
     local pattern="${src}.bak.*"
     # shellcheck disable=SC2086
     ls -1t $pattern 2>/dev/null | tail -n +"$((BACKUP_KEEP + 1))" | xargs -r rm -f --
@@ -127,6 +247,16 @@ is_container() {
 
 reboot_required() {
     [ -f /var/run/reboot-required ] || [ -f /run/reboot-required ]
+}
+
+# Surface a pending reboot without forcing one (for non-interactive paths that
+# never prompt). Never reboots; only informs.
+notify_reboot_if_required() {
+    if reboot_required; then
+        yellow_msg "A reboot is required (see /var/run/reboot-required). Reboot when convenient: reboot"
+    else
+        green_msg "No reboot required (no pending kernel/core update)."
+    fi
 }
 
 # Root check
@@ -177,8 +307,21 @@ apt_update_once() {
     fi
 }
 
-# Ask Reboot (only when the system actually needs it)
+has_failures() { [ "${#FAILED_STEPS[@]}" -gt 0 ]; }
+
+# Ask Reboot (only when the system actually needs it).
+# INVARIANT: FAILED_STEPS non-empty => reboot MUST NOT execute automatically.
+# On failure paths callers must use ask_reboot_guarded instead, which withholds
+# the reboot and preserves the non-zero status.
 ask_reboot() {
+    if has_failures; then
+        if reboot_required; then
+            red_msg "Reboot is required BUT WITHHELD: this run has failures (${FAILED_STEPS[*]}). Review the errors above and reboot manually when fixed."
+        else
+            yellow_msg "Run completed with failures (${FAILED_STEPS[*]}); no reboot pending."
+        fi
+        return 1
+    fi
     if [ ! -t 0 ] && [ "$ASSUME_YES" != "1" ]; then
         yellow_msg "Non-interactive shell: skipping reboot prompt."
         return 0
@@ -213,6 +356,21 @@ ask_reboot() {
     done
 }
 
+# Guarded reboot entry point for pipelines: never reboots when FAILED_STEPS is
+# non-empty (withholds + warns), otherwise behaves exactly like ask_reboot.
+# Returns 0 on the success path, 1 when failures were recorded.
+ask_reboot_guarded() {
+    if has_failures; then
+        if reboot_required; then
+            red_msg "Reboot is required BUT WITHHELD: this run has failures (${FAILED_STEPS[*]}). Review the errors above and reboot manually when fixed."
+        else
+            yellow_msg "Run completed with failures (${FAILED_STEPS[*]}); no reboot pending."
+        fi
+        return 1
+    fi
+    ask_reboot
+}
+
 # Update & Upgrade & Remove & Clean
 complete_update() {
     echo
@@ -223,10 +381,22 @@ complete_update() {
     export NEEDRESTART_MODE=a
     apt_update_once || yellow_msg "package list update had warnings, continuing..."
     # NOTE: full-upgrade alone covers upgrade; running both is redundant.
-    apt-get -y full-upgrade
-    apt-get -y autoremove --purge
+    if ! apt-get -y full-upgrade; then
+        red_msg "System upgrade FAILED (apt-get full-upgrade returned non-zero) - NOT reporting success."
+        echo
+        return 1
+    fi
+    if ! apt-get -y autoremove --purge; then
+        red_msg "apt autoremove reported errors (upgrade itself succeeded) - NOT reporting success."
+        echo
+        return 1
+    fi
     # NOTE: clean covers autoclean; one is enough.
-    apt-get -y clean
+    if ! apt-get -y clean; then
+        red_msg "apt clean reported errors (upgrade itself succeeded) - NOT reporting success."
+        echo
+        return 1
+    fi
 
     echo
     green_msg 'System Updated & Cleaned Successfully.'
@@ -269,7 +439,7 @@ installations() {
     #    (pulls desktop/dbus stack), no busybox (redundant on systemd distros),
     #    no net-tools (deprecated; iproute2 replaces it), no ubuntu-keyring
     #    (breaks pure Debian).
-    packages=(
+    local packages=(
         apt-transport-https apt-utils bash-completion ca-certificates cron
         curl gnupg iproute2 ethtool kmod procps locales lsb-release
         software-properties-common
@@ -321,12 +491,88 @@ enable_packages() {
     local svc
     for svc in cron; do
         if systemctl list-unit-files 2>/dev/null | grep -q "^${svc}.service"; then
-            systemctl enable "$svc" 2>/dev/null || true
+            systemctl enable --now "$svc" 2>/dev/null || systemctl enable "$svc" 2>/dev/null || true
         fi
     done
     echo
     green_msg 'Packages Enabled Successfully.'
     echo
+}
+
+# swap_entry_active <path>: true when /etc/fstab contains an ACTIVE
+# (non-comment, non-blank) line referencing the path. Commented or stale
+# mentions do not count (and must never be deleted as "duplicates").
+swap_entry_active() {
+    [ -f /etc/fstab ] || return 1
+    grep -vE '^[[:space:]]*(#|$)' /etc/fstab 2>/dev/null | grep -qF "$1"
+}
+
+# swap_build_file <target> [dd]: allocate + mkswap a swap file WITHOUT
+# activating it. Sets SWAP_BUILT_WITH to "fallocate" or "dd". Never touches
+# the live swap or fstab; safe to run against a staging path.
+SWAP_BUILT_WITH=""
+swap_build_file() {
+    local target="$1" mode="${2:-auto}" tdir
+    SWAP_BUILT_WITH=""
+    tdir=$(dirname "$target")
+    [ -d "$tdir" ] || tdir="/"
+    # CoW/odd filesystems: fallocate leaves holes swapon rejects
+    # ("swapfile has holes"). dd writes real blocks everywhere.
+    local fstype use_dd_only=0 btrfs_nocow=0
+    fstype=$(stat -f -c %T "$tdir" 2>/dev/null || echo unknown)
+    case "$fstype" in
+        btrfs)
+            yellow_msg "Filesystem btrfs: using dd + NOCOW (mandatory for swap on btrfs)."
+            use_dd_only=1
+            btrfs_nocow=1
+            ;;
+        overlayfs|aufs|zfs|xfs)
+            yellow_msg "Filesystem $fstype does not support fallocate swap, using dd directly."
+            use_dd_only=1
+            ;;
+    esac
+    [ "$mode" = "dd" ] && use_dd_only=1
+    yellow_msg "Allocating $SWAP_SIZE at $target..."
+    local created_with_fallocate=false
+    if [ "$use_dd_only" -eq 0 ]; then
+        if fallocate -l "$SWAP_SIZE" "$target" 2>/dev/null; then
+            created_with_fallocate=true
+        else
+            yellow_msg "fallocate unavailable/failed, falling back to dd..."
+        fi
+    fi
+    if [ "$created_with_fallocate" = true ]; then
+        SWAP_BUILT_WITH="fallocate"
+    else
+        local count
+        count=$(swap_size_to_mb "$SWAP_SIZE")
+        if [ "$btrfs_nocow" -eq 1 ]; then
+            # btrfs REQUIRES a fresh NOCOW file: preallocate empty, set the
+            # flag, THEN write data. chattr +C on an existing non-empty file
+            # is a silent no-op, so order matters.
+            rm -f "$target"
+            touch "$target"
+            chmod 600 "$target"
+            if ! chattr +C "$target" 2>/dev/null; then
+                red_msg "btrfs: cannot set NOCOW on $target - swap is unsupported on this subvolume (compressed/odd mount?). Leaving NO swap; system runs without it."
+                rm -f "$target"
+                return 1
+            fi
+        fi
+        if ! dd if=/dev/zero of="$target" bs=1M count="$count" status=none; then
+            red_msg "Failed to create swap file via dd"
+            rm -f "$target"
+            return 1
+        fi
+        SWAP_BUILT_WITH="dd"
+    fi
+    chmod 600 "$target"
+    if ! mkswap "$target" >/dev/null 2>&1; then
+        red_msg "mkswap failed"
+        rm -f "$target"
+        return 1
+    fi
+    return 0
 }
 
 # Swap Maker — idempotent, container-aware, fstype-aware
@@ -340,11 +586,9 @@ swap_maker() {
         return 0
     fi
 
-    if ! [[ "$SWAP_SIZE" =~ ^[0-9]+[GMKgmk]?$ ]]; then
-        red_msg "Invalid SWAP_SIZE: $SWAP_SIZE (use e.g., 2G, 4096M)"
-        return 1
-    fi
+    validate_swap_size "$SWAP_SIZE" || return 1
 
+    local SWAP_REPLACE=0
     # Idempotent: already-active swap of the right size -> nothing to do.
     # NOTE: /proc/swaps "Size" excludes the swap header page, so an exact
     # KB comparison NEVER matches the requested size (2G file shows as
@@ -355,17 +599,72 @@ swap_maker() {
         cur_bytes=$(stat -c %s "$SWAP_PATH" 2>/dev/null || echo 0)
         want_bytes=$(( $(swap_size_to_mb "$SWAP_SIZE") * 1024 * 1024 ))
         diff_bytes=$(( ${cur_bytes:-0} - ${want_bytes:-0} ))
-        if [ "${diff_bytes#-}" -le 1048576 ] \
-            && grep -qF "$SWAP_PATH" /etc/fstab; then
-            green_msg "Swap $SWAP_PATH already active (correct size) with fstab entry. Nothing to do."
-            echo
-            return 0
-        fi
-        yellow_msg "Swap $SWAP_PATH is active but differs from desired $SWAP_SIZE. Recreating..."
-        swapoff "$SWAP_PATH" 2>/dev/null || {
-            red_msg "Failed to swapoff $SWAP_PATH - maybe in use"
+        if [ "${diff_bytes#-}" -le 1048576 ]; then
+            if swap_entry_active "$SWAP_PATH"; then
+                green_msg "Swap $SWAP_PATH already active (correct size) with fstab entry. Nothing to do."
+                echo
+                return 0
+            fi
+            # Correct file, correct size, only the fstab entry is missing:
+            # preserve the live swap file and just repair persistence instead
+            # of swapoff/rm/dd for no reason.
+            yellow_msg "Swap $SWAP_PATH is active with the correct size but its fstab entry is missing. Repairing fstab only (keeping the live swap file)."
+            backup_file /etc/fstab
+            echo "$SWAP_PATH   none    swap    sw,nofail    0   0" >> /etc/fstab
+            swapon -a 2>/dev/null || true
+            if grep -qs "^${SWAP_PATH}[[:space:]]" /proc/swaps && swap_entry_active "$SWAP_PATH"; then
+                green_msg "Swap $SWAP_PATH already active (correct size); fstab entry restored. Nothing else to do."
+                echo
+                return 0
+            fi
+            red_msg "Failed to restore the fstab entry for $SWAP_PATH."
             return 1
-        }
+        fi
+        yellow_msg "Swap $SWAP_PATH is active but differs from desired $SWAP_SIZE. Preparing replacement FIRST (old swap stays live until the new file is proven)..."
+        SWAP_REPLACE=1
+    else
+        SWAP_REPLACE=0
+    fi
+
+    if [ "${SWAP_REPLACE:-0}" = "1" ]; then
+        # Safe recreate: stage at $SWAP_PATH.new, mkswap it, and only then
+        # swapoff the old file + move the new one into place. A failure here
+        # leaves the old working swap untouched (never worse than before).
+        if ! swap_build_file "${SWAP_PATH}.new"; then
+            red_msg "Replacement swap preparation failed; keeping the existing working swap at $SWAP_PATH."
+            rm -f "${SWAP_PATH}.new"
+            return 1
+        fi
+        yellow_msg "Replacement swap prepared; switching over..."
+        if ! swapoff "$SWAP_PATH" 2>/dev/null; then
+            red_msg "Failed to swapoff $SWAP_PATH - keeping existing swap; discarding replacement."
+            rm -f "${SWAP_PATH}.new"
+            return 1
+        fi
+        rm -f "$SWAP_PATH"
+        if ! mv -f "${SWAP_PATH}.new" "$SWAP_PATH"; then
+            red_msg "Failed to install replacement swap; trying to re-enable previous state."
+            swapon "$SWAP_PATH" 2>/dev/null || true
+            rm -f "${SWAP_PATH}.new"
+            return 1
+        fi
+        chmod 600 "$SWAP_PATH"
+        if ! swapon "$SWAP_PATH" 2>/dev/null; then
+            red_msg "swapon of the replacement failed; old swap was already off. Check dmesg."
+            return 1
+        fi
+        if ! swap_entry_active "$SWAP_PATH"; then
+            backup_file /etc/fstab
+            echo "$SWAP_PATH   none    swap    sw,nofail    0   0" >> /etc/fstab
+        fi
+        if grep -qs "^${SWAP_PATH}[[:space:]]" /proc/swaps; then
+            green_msg "SWAP Recreated & Activated Successfully."
+        else
+            red_msg "SWAP recreation verification failed"
+            return 1
+        fi
+        echo
+        return 0
     fi
 
     if [ -f "$SWAP_PATH" ]; then
@@ -373,10 +672,17 @@ swap_maker() {
         rm -f "$SWAP_PATH"
     fi
 
-    if grep -qF "$SWAP_PATH" /etc/fstab; then
+    if swap_entry_active "$SWAP_PATH"; then
         yellow_msg "Removing old fstab entry for $SWAP_PATH"
         backup_file /etc/fstab
-        sed -i "\|$SWAP_PATH|d" /etc/fstab
+        # Delete only ACTIVE (non-comment, non-blank) lines referencing the
+        # path; documentation comments mentioning it are preserved. awk keeps
+        # this readable where a negated-address sed gets fragile.
+        awk -v p="$SWAP_PATH" '($0 ~ /^[[:space:]]*(#|$)/) {print; next} index($0, p) == 0 {print}' /etc/fstab > /etc/fstab.optnew \
+            && cat /etc/fstab.optnew > /etc/fstab && rm -f /etc/fstab.optnew
+    elif grep -qF "$SWAP_PATH" /etc/fstab; then
+        # Commented/stale mention only: leave documentation comments alone.
+        yellow_msg "fstab mentions $SWAP_PATH only in non-active form; leaving it untouched."
     fi
 
     local swap_dir avail_mb swap_mb
@@ -392,58 +698,7 @@ swap_maker() {
         return 1
     fi
 
-    # CoW/odd filesystems: fallocate leaves holes swapon rejects
-    # ("swapfile has holes"). dd writes real blocks everywhere.
-    local fstype use_dd_only=0 btrfs_nocow=0
-    fstype=$(stat -f -c %T "$swap_dir" 2>/dev/null || echo unknown)
-    case "$fstype" in
-        btrfs)
-            yellow_msg "Filesystem btrfs: using dd + NOCOW (mandatory for swap on btrfs)."
-            use_dd_only=1
-            btrfs_nocow=1
-            ;;
-        overlayfs|aufs|zfs|xfs)
-            yellow_msg "Filesystem $fstype does not support fallocate swap, using dd directly."
-            use_dd_only=1
-            ;;
-    esac
-
-    yellow_msg "Allocating $SWAP_SIZE at $SWAP_PATH..."
-    local created_with_fallocate=false
-    if [ "$use_dd_only" -eq 0 ]; then
-        if fallocate -l "$SWAP_SIZE" "$SWAP_PATH" 2>/dev/null; then
-            created_with_fallocate=true
-        else
-            yellow_msg "fallocate unavailable/failed, falling back to dd..."
-        fi
-    fi
-    if [ "$created_with_fallocate" != true ]; then
-        local count
-        count=$(swap_size_to_mb "$SWAP_SIZE")
-        if [ "$btrfs_nocow" -eq 1 ]; then
-            # btrfs REQUIRES a fresh NOCOW file: preallocate empty, set the
-            # flag, THEN write data. chattr +C on an existing non-empty file
-            # is a silent no-op, so order matters.
-            rm -f "$SWAP_PATH"
-            touch "$SWAP_PATH"
-            chmod 600 "$SWAP_PATH"
-            if ! chattr +C "$SWAP_PATH" 2>/dev/null; then
-                red_msg "btrfs: cannot set NOCOW on $SWAP_PATH - swap is unsupported on this subvolume (compressed/odd mount?). Leaving NO swap; system runs without it."
-                rm -f "$SWAP_PATH"
-                return 1
-            fi
-        fi
-        if ! dd if=/dev/zero of="$SWAP_PATH" bs=1M count="$count" status=none; then
-            red_msg "Failed to create swap file via dd"
-            rm -f "$SWAP_PATH"
-            return 1
-        fi
-    fi
-
-    chmod 600 "$SWAP_PATH"
-    if ! mkswap "$SWAP_PATH" >/dev/null 2>&1; then
-        red_msg "mkswap failed"
-        rm -f "$SWAP_PATH"
+    if ! swap_build_file "$SWAP_PATH"; then
         return 1
     fi
     # Capture swapon stderr: the exact message ("has holes" vs "Operation
@@ -451,25 +706,16 @@ swap_maker() {
     # swap. Swallowing it (2>/dev/null) leaves the user guessing.
     local swapon_err=""
     if ! swapon_err=$(swapon "$SWAP_PATH" 2>&1); then
-        if [ "$created_with_fallocate" = true ]; then
+        if [ "${SWAP_BUILT_WITH:-}" = "fallocate" ]; then
             # Classic failure: fallocate hole-punching on an FS that
             # claims support but rejects swapon. Retry once with dd.
             yellow_msg "swapon rejected fallocate file: ${swapon_err:-unknown error}"
             yellow_msg "Retrying once with dd (real blocks, no holes)..."
             rm -f "$SWAP_PATH"
-            local count2
-            count2=$(swap_size_to_mb "$SWAP_SIZE")
-            dd if=/dev/zero of="$SWAP_PATH" bs=1M count="$count2" status=none || {
-                red_msg "Failed to create swap file via dd"
-                rm -f "$SWAP_PATH"
+            if ! swap_build_file "$SWAP_PATH" dd; then
+                red_msg "Failed to rebuild swap file via dd"
                 return 1
-            }
-            chmod 600 "$SWAP_PATH"
-            mkswap "$SWAP_PATH" >/dev/null 2>&1 || {
-                red_msg "mkswap failed on retry"
-                rm -f "$SWAP_PATH"
-                return 1
-            }
+            fi
             if ! swapon_err=$(swapon "$SWAP_PATH" 2>&1); then
                 red_msg "swapon failed: ${swapon_err:-unknown error}"
                 red_msg "Host likely forbids swap (container) or FS rejected it. Check dmesg. Continuing without swap."
@@ -485,7 +731,7 @@ swap_maker() {
     fi
 
     # Safe fstab entry with nofail to guarantee clean boot
-    if ! grep -qF "$SWAP_PATH" /etc/fstab; then
+    if ! swap_entry_active "$SWAP_PATH"; then
         backup_file /etc/fstab
         echo "$SWAP_PATH   none    swap    sw,nofail    0   0" >> /etc/fstab
     fi
@@ -511,10 +757,28 @@ swap_size_to_mb() {
     esac
 }
 
-swap_size_to_kb() {
-    local mb
-    mb=$(swap_size_to_mb "$1")
-    echo $((mb * 1024))
+# Validate a swap-size string (e.g. 2G, 4096M, 512). Rejects bad formats and
+# zero/degenerate sizes (0, 0G, 0M) that would only fail later in mkswap.
+validate_swap_size() {
+    local s="${1:-}" mb num
+    if ! [[ "$s" =~ ^[0-9]+[GMKgmk]?$ ]]; then
+        red_msg "Invalid SWAP_SIZE: $s (use e.g., 2G, 4096M)"
+        return 1
+    fi
+    # Reject an explicit zero request in ANY unit before unit conversion can
+    # round it up (e.g. swap_size_to_mb maps 0K -> max(1, 0) = 1MB).
+    num="${s%[GMKgmk]}"
+    num="${num%[gmk]}"
+    if ! [[ "$num" =~ ^[0-9]+$ ]] || [ "$((10#$num))" -le 0 ]; then
+        red_msg "Invalid SWAP_SIZE: $s (size must be greater than zero; use e.g., 2G, 4096M)"
+        return 1
+    fi
+    mb=$(swap_size_to_mb "$s" 2>/dev/null || echo 0)
+    if ! [[ "$mb" =~ ^[0-9]+$ ]] || [ "$mb" -le 0 ]; then
+        red_msg "Invalid SWAP_SIZE: $s (size must be greater than zero; use e.g., 2G, 4096M)"
+        return 1
+    fi
+    return 0
 }
 
 # SYSCTL Optimization
@@ -1048,10 +1312,9 @@ net.ipv4.tcp_max_syn_backlog = 4096
 net.ipv4.tcp_max_tw_buckets = 16384
 net.ipv4.tcp_mem = $tcp_mem
 net.ipv4.tcp_notsent_lowat = 16384
-net.ipv4.tcp_sack = 1
-net.ipv4.tcp_dsack = 1
+# NOTE: tcp_sack/tcp_dsack/tcp_window_scaling come from the shared block
+# below; do NOT re-add them here (duplicate keys fail the self-check).
 net.ipv4.tcp_slow_start_after_idle = 1
-net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_adv_win_scale = 1
 $common_net
 
@@ -1176,22 +1439,27 @@ EOF
 
     echo
     yellow_msg "Applying sysctl settings (profile: $selected_profile)..."
-    local apply_log
-    apply_log=$(new_tmp)
+    local apply_log apply_rc=0
+    apply_log=$(new_tmp) || return 1
     if sysctl --system 2>&1 | tee "$apply_log"; then
-        if grep -q -i "error\|invalid\|cannot stat\|unknown key\|permission denied\|read-only" "$apply_log"; then
-            yellow_msg "Some sysctl keys reported warnings:"
-            grep -i "error\|invalid\|cannot stat\|unknown key\|permission denied\|read-only" "$apply_log" | head -n 20
-        else
-            green_msg "sysctl --system applied successfully"
-            echo
-            green_msg "Network is Optimized (profile: $selected_profile). Config: $SYS_OPTIMIZER_PATH"
-            echo
-            return 0
-        fi
+        apply_rc=0
     else
-        yellow_msg "sysctl --system exited non-zero, checking details..."
+        apply_rc=$?
+    fi
+    # PIPESTATUS refinement: with `set -o pipefail` the pipeline status above
+    # is sysctl's own status (tee rarely fails); treat non-zero as fatal.
+    if [ "$apply_rc" -ne 0 ]; then
+        red_msg "sysctl --system exited with status $apply_rc; checking details..."
         grep -i "error\|invalid\|cannot stat\|unknown key\|permission denied\|read-only" "$apply_log" | head -n 20 || true
+    elif grep -q -i "error\|invalid\|cannot stat\|unknown key\|permission denied\|read-only" "$apply_log"; then
+        yellow_msg "Some sysctl keys reported warnings:"
+        grep -i "error\|invalid\|cannot stat\|unknown key\|permission denied\|read-only" "$apply_log" | head -n 20
+    else
+        green_msg "sysctl --system applied successfully"
+        echo
+        green_msg "Network is Optimized (profile: $selected_profile). Config: $SYS_OPTIMIZER_PATH"
+        echo
+        return 0
     fi
 
     # Self-heal pass 1: comment out keys the kernel does not HAVE
@@ -1200,6 +1468,7 @@ EOF
     local missing_keys
     missing_keys=$(grep -i "cannot stat\|unknown key\|No such file" "$apply_log" 2>/dev/null \
         | grep -oE "/proc/sys/[A-Za-z0-9_/]+" | sed 's|^/proc/sys/||; s|/|.|g' | sort -u)
+    local healed=0
     if [ -n "$missing_keys" ]; then
         yellow_msg "Healing unsupported keys (commenting out, one pass): $missing_keys"
         backup_file "$SYS_OPTIMIZER_PATH"
@@ -1207,49 +1476,192 @@ EOF
         for mk in $missing_keys; do
             sed -i "s|^${mk//./\\.}[[:space:]]*=|# UNSUPPORTED ON THIS KERNEL: &|" "$SYS_OPTIMIZER_PATH"
         done
-        local apply_log2
-        apply_log2=$(new_tmp)
-        if sysctl --system 2>&1 | tee "$apply_log2"; then
-            if ! grep -q -i "cannot stat\|unknown key" "$apply_log2"; then
-                green_msg "sysctl applied after healing unsupported keys"
-            fi
-        fi
+        healed=1
+    fi
+
+    # Re-apply after healing (or first apply failed without healable keys) and
+    # judge the result ONLY by errors that reference keys THIS script manages
+    # or by a non-zero exit status. Unrelated sysctl.d noise must not fail us;
+    # managed-key failures must not pass us.
+    local apply_log2 apply_rc2=0
+    apply_log2=$(new_tmp) || return 1
+    if sysctl --system 2>&1 | tee "$apply_log2"; then
+        apply_rc2=0
     else
-        yellow_msg "Remaining warnings are permission/read-only (typical inside containers) - config file kept as-is for the host/next boot."
+        apply_rc2=$?
+    fi
+    if [ "$apply_rc2" -ne 0 ]; then
+        red_msg "sysctl --system failed with status $apply_rc2 after healing; network tuning NOT applied."
+        grep -i "error\|invalid\|cannot stat\|unknown key\|permission denied\|read-only" "$apply_log2" | head -n 20 || true
+        echo
+        red_msg "Network optimization FAILED (profile: $selected_profile). Config kept at: $SYS_OPTIMIZER_PATH"
+        echo
+        return 1
+    fi
+    # Collect managed-key failures from the final apply log.
+    local managed_fail=""
+    managed_fail=$(managed_sysctl_failures "$apply_log2" "$SYS_OPTIMIZER_PATH")
+    if [ -n "$managed_fail" ]; then
+        # Permission/read-only failures inside a container are the one
+        # intentional exception: the file is written for the host/next boot,
+        # but the live kernel cannot be tuned from inside. Report honestly.
+        if is_container && only_readonly_failures "$apply_log2"; then
+            yellow_msg "Container detected: managed keys cannot be applied from inside (host controls them)."
+            echo "$managed_fail" | head -n 20
+            echo
+            yellow_msg "Network config WRITTEN but NOT APPLIED in container (profile: $selected_profile). Config: $SYS_OPTIMIZER_PATH"
+            echo
+            return 1
+        fi
+        red_msg "Managed sysctl keys failed to apply:"
+        echo "$managed_fail" | head -n 20
+        echo
+        red_msg "Network optimization FAILED (profile: $selected_profile). Config kept at: $SYS_OPTIMIZER_PATH"
+        echo
+        return 1
+    fi
+    if [ "$healed" = "1" ]; then
+        green_msg "sysctl applied after healing unsupported keys"
+    else
+        green_msg "sysctl --system applied successfully"
+    fi
+    if only_readonly_failures "$apply_log2" && grep -q -i "permission denied\|read-only" "$apply_log2"; then
+        yellow_msg "Note: unrelated read-only warnings present (typical inside containers); all MANAGED keys applied."
     fi
 
     echo
     green_msg "Network is Optimized (profile: $selected_profile). Config: $SYS_OPTIMIZER_PATH"
     echo
+    return 0
 }
 
-# Remove old SSH config (strip keys WE manage; preserve everything else)
+# managed_sysctl_failures <apply-log> <managed-conf>: print managed keys from
+# the conf that the apply log reports as failed (unknown key / cannot stat /
+# invalid / error referencing the key's /proc path or the key name).
+managed_sysctl_failures() {
+    local log="$1" conf="$2" key path
+    [ -f "$log" ] && [ -f "$conf" ] || return 0
+    grep -v "^#" "$conf" 2>/dev/null | grep -v "^$" | cut -d= -f1 \
+        | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sort -u | while IFS= read -r key; do
+        [ -n "$key" ] || continue
+        path="/proc/sys/$(printf '%s' "$key" | sed 's|\.|/|g')"
+        if grep -qiF "$path" "$log" 2>/dev/null || grep -qi "unknown key.*${key}\|${key}.*unknown key\|invalid.*${key}\|${key}.*invalid\|error.*${key}\|${key}.*error" "$log" 2>/dev/null; then
+            printf '%s\n' "$key"
+        fi
+    done
+    return 0
+}
+
+# only_readonly_failures <apply-log>: true when every failure line is a
+# permission/read-only failure (no unknown-key/invalid/cannot-stat lines).
+only_readonly_failures() {
+    local log="$1"
+    [ -f "$log" ] || return 1
+    if grep -qi "cannot stat\|unknown key\|No such file\|invalid argument\|invalid value" "$log" 2>/dev/null; then
+        return 1
+    fi
+    grep -qi "permission denied\|read-only" "$log" 2>/dev/null
+}
+
+# Drop-in support: manage sshd_config.d/00-optimizer.conf when the main config
+# actually includes that directory (first-match-wins => lexically early name
+# wins over stock 50/60-cloudimg drop-ins). Otherwise fall back to editing the
+# main file's global section above any Match block (older systems).
+sshd_supports_dropin() {
+    grep -Eq '^[[:space:]]*Include[[:space:]]+.*sshd_config\.d/\*\.conf' "$SSH_PATH" 2>/dev/null || return 1
+    return 0
+}
+
+# Ensure the drop-in directory exists when Include references it (minimal
+# images may ship the Include line without the directory).
+sshd_ensure_dropin_dir() {
+    [ -d /etc/ssh/sshd_config.d ] && return 0
+    mkdir -p -m 0755 /etc/ssh/sshd_config.d 2>/dev/null || return 1
+    [ -d /etc/ssh/sshd_config.d ] || return 1
+    return 0
+}
+
+# First line number (1-based) of the first ACTIVE (non-comment, non-blank)
+# Match directive, or empty when there is none.
+sshd_match_start() {
+    grep -nE '^[[:space:]]*Match([[:space:]]|$)' "$1" 2>/dev/null \
+        | grep -vE '^[0-9]+:[[:space:]]*#' | head -n1 | cut -d: -f1
+}
+
+# Remove old SSH config (strip keys WE manage from the GLOBAL section only;
+# preserve everything else, including all Match blocks byte-for-byte).
+# In drop-in mode the main file must NOT be touched at all: ssh_prep() sets
+# SSH_SKIP_MAIN_STRIP=1 BEFORE this runs, so this becomes a no-op.
 remove_old_ssh_conf() {
     if [ ! -f "$SSH_PATH" ]; then
         red_msg "SSH config not found, skipping backup"
         return 0
     fi
+    if [ "${SSH_SKIP_MAIN_STRIP:-0}" = "1" ]; then
+        yellow_msg "Drop-in mode: leaving $SSH_PATH untouched (managed via $SSH_DROPIN_PATH)."
+        return 0
+    fi
     backup_file "$SSH_PATH"
+    SSH_MAIN_SNAP="$BACKUP_LAST"
     echo
     yellow_msg "SSH config backup created (rotated, last $BACKUP_KEEP kept)"
     echo
 
-    sed -i -e 's/^\s*#\?UseDNS.*/UseDNS no/' \
-        -e 's/^\s*#\?Compression.*/Compression no/' \
-        -e '/^\s*Ciphers.*/d' \
-        -e '/^\s*MaxAuthTries/d' \
-        -e '/^\s*MaxSessions/d' \
-        -e '/^\s*LoginGraceTime/d' \
-        -e '/^\s*TCPKeepAlive/d' \
-        -e '/^\s*ClientAliveInterval/d' \
-        -e '/^\s*ClientAliveCountMax/d' \
-        -e '/^\s*AllowAgentForwarding/d' \
-        -e '/^\s*AllowTcpForwarding/d' \
-        -e '/^\s*GatewayPorts/d' \
-        -e '/^\s*PermitTunnel/d' \
-        -e '/^\s*X11Forwarding/d' "$SSH_PATH"
+    # Operate on the global section only: split at the first active Match,
+    # transform the head, then rejoin with the untouched tail.
+    local _match_at="" _head="" _tail=""
+    _match_at=$(sshd_match_start "$SSH_PATH")
+    _head=$(mktemp) || return 1
+    OPT_TMPFILES+=("$_head")
+    if [ -n "$_match_at" ]; then
+        _tail=$(mktemp) || return 1
+        OPT_TMPFILES+=("$_tail")
+        head -n $((_match_at - 1)) "$SSH_PATH" > "$_head"
+        tail -n +"$_match_at" "$SSH_PATH" > "$_tail"
+    else
+        cat "$SSH_PATH" > "$_head"
+    fi
+    # Character classes (not \s) for portability, and optional whitespace
+    # after '#' so '#Key', '# Key' and '   # Key' are all handled.
+    # NOTE: UseDNS/Compression normalize first match; the rest are deleted
+    # (legacy Ciphers line migration + managed keys re-added by set_sshd_opt).
+    sed -i -e 's/^[[:space:]]*#\?[[:space:]]*UseDNS.*/UseDNS no/' \
+        -e 's/^[[:space:]]*#\?[[:space:]]*Compression.*/Compression no/' \
+        -e '/^[[:space:]]*#\?[[:space:]]*Ciphers.*/d' \
+        -e '/^[[:space:]]*#\?[[:space:]]*MaxAuthTries/d' \
+        -e '/^[[:space:]]*#\?[[:space:]]*MaxSessions/d' \
+        -e '/^[[:space:]]*#\?[[:space:]]*LoginGraceTime/d' \
+        -e '/^[[:space:]]*#\?[[:space:]]*TCPKeepAlive/d' \
+        -e '/^[[:space:]]*#\?[[:space:]]*ClientAliveInterval/d' \
+        -e '/^[[:space:]]*#\?[[:space:]]*ClientAliveCountMax/d' \
+        -e '/^[[:space:]]*#\?[[:space:]]*AllowAgentForwarding/d' \
+        -e '/^[[:space:]]*#\?[[:space:]]*AllowTcpForwarding/d' \
+        -e '/^[[:space:]]*#\?[[:space:]]*GatewayPorts/d' \
+        -e '/^[[:space:]]*#\?[[:space:]]*PermitTunnel/d' \
+        -e '/^[[:space:]]*#\?[[:space:]]*X11Forwarding/d' "$_head"
+    if [ -n "$_match_at" ]; then
+        cat "$_head" "$_tail" > "$SSH_PATH"
+    else
+        cat "$_head" > "$SSH_PATH"
+    fi
     # NOTE: the old script appended a hardcoded "Ciphers ..." line; the delete
     # above removes it (migration to distro defaults). Nothing re-adds it.
+}
+
+# ssh_prep: decide drop-in vs legacy BEFORE any main-file mutation, so
+# remove_old_ssh_conf can skip the main file entirely in drop-in mode.
+# Sets SSH_USE_DROPIN and SSH_SKIP_MAIN_STRIP. Never touches file content.
+ssh_prep() {
+    SSH_USE_DROPIN=0
+    SSH_SKIP_MAIN_STRIP=0
+    [ -f "$SSH_PATH" ] || return 0
+    if sshd_supports_dropin; then
+        if sshd_ensure_dropin_dir; then
+            SSH_USE_DROPIN=1
+            SSH_SKIP_MAIN_STRIP=1
+        fi
+    fi
+    return 0
 }
 
 # Update SSH config (idempotent; reload, never restart; rollback on failure)
@@ -1264,14 +1676,43 @@ update_sshd_conf() {
         return 0
     fi
 
-    set_sshd_opt() {
-        local key="$1" val="$2"
-        if grep -qE "^[[:space:]]*${key}[[:space:]]+" "$SSH_PATH"; then
-            sed -i -E "s|^[[:space:]]*${key}[[:space:]]+.*|${key} ${val}|" "$SSH_PATH"
-        else
-            echo "${key} ${val}" >> "$SSH_PATH"
+    # ONE exact pre-run snapshot of the main config for this execution.
+    # Rollback restores THIS path — never "newest file" heuristics.
+    # NOTE: in legacy mode remove_old_ssh_conf already snapshotted the TRUE
+    # pre-run state into SSH_MAIN_SNAP; never overwrite it here (a second
+    # snapshot would capture the post-strip file and rollback would lose the
+    # original managed-key values).
+    SSH_DROPIN_SNAP=""
+    SSH_DROPIN_LEGACY_SNAP=""
+    if [ -z "${SSH_MAIN_SNAP:-}" ] && [ -f "$SSH_PATH" ]; then
+        backup_file "$SSH_PATH" >/dev/null 2>&1 || true
+        SSH_MAIN_SNAP="$BACKUP_LAST"
+    fi
+
+    # Prefer a managed drop-in when the main config uses Include (Ubuntu
+    # 22.04+/Debian 12 default). OpenSSH applies the FIRST obtained value, so
+    # keys appended to the tail of the main file would silently lose to any
+    # drop-in that sets the same key. Lexically-early 00- name wins over
+    # stock 50/60-cloudimg drop-ins.
+    # NOTE: ssh_prep() already ran (via the ssh-clean step) and set
+    # SSH_USE_DROPIN/SSH_SKIP_MAIN_STRIP. Re-derive defensively in case this
+    # function is invoked without the prep step.
+    if [ "${SSH_SKIP_MAIN_STRIP:-0}" != "1" ]; then
+        ssh_prep
+    fi
+    if [ "$SSH_USE_DROPIN" = "1" ]; then
+        yellow_msg "sshd uses Include; managing $SSH_DROPIN_PATH instead of touching $SSH_PATH."
+        if [ -f "$SSH_DROPIN_LEGACY" ] && [ "$SSH_DROPIN_LEGACY" != "$SSH_DROPIN_PATH" ]; then
+            yellow_msg "Removing legacy optimizer drop-in $SSH_DROPIN_LEGACY (superseded by $SSH_DROPIN_PATH)."
+            backup_file "$SSH_DROPIN_LEGACY" >/dev/null 2>&1 || true
+            SSH_DROPIN_LEGACY_SNAP="$BACKUP_LAST"
+            rm -f "$SSH_DROPIN_LEGACY"
         fi
-    }
+        if [ -f "$SSH_DROPIN_PATH" ]; then
+            backup_file "$SSH_DROPIN_PATH" >/dev/null 2>&1 || true
+            SSH_DROPIN_SNAP="$BACKUP_LAST"
+        fi
+    fi
 
     # Rationale:
     #  Compression no            - saves CPU/jitter; oracle-attack history
@@ -1282,19 +1723,80 @@ update_sshd_conf() {
     #  PermitTunnel no           - L3 ssh -w tunnels off (you use VPN apps);
     #                              set to yes only if you use 'ssh -w'
     #  MaxAuthTries/MaxSessions/LoginGraceTime - brute-force/DoS surface
-    set_sshd_opt "UseDNS" "no"
-    set_sshd_opt "Compression" "no"
-    set_sshd_opt "TCPKeepAlive" "yes"
-    set_sshd_opt "ClientAliveInterval" "300"
-    set_sshd_opt "ClientAliveCountMax" "3"
-    set_sshd_opt "MaxAuthTries" "3"
-    set_sshd_opt "MaxSessions" "10"
-    set_sshd_opt "LoginGraceTime" "60"
-    set_sshd_opt "AllowTcpForwarding" "yes"
-    set_sshd_opt "GatewayPorts" "no"
-    set_sshd_opt "PermitTunnel" "no"
-    set_sshd_opt "X11Forwarding" "no"
-    set_sshd_opt "AllowAgentForwarding" "no"
+    if [ "$SSH_USE_DROPIN" = "1" ]; then
+        # Deterministic full-file write: re-running produces the same file.
+        local _ssh_tmp
+        _ssh_tmp=$(mktemp "$(dirname "$SSH_DROPIN_PATH")/.00-optimizer.XXXXXX") || {
+            red_msg "Failed to stage the sshd drop-in."
+            return 1
+        }
+        OPT_TMPFILES+=("$_ssh_tmp")
+        {
+            echo "# Managed by Linux-Optimize (v$SCRIPT_VERSION) - do not edit."
+            echo "# Drop-in overrides $SSH_PATH (first obtained value wins)."
+            echo "UseDNS no"
+            echo "Compression no"
+            echo "TCPKeepAlive yes"
+            echo "ClientAliveInterval 300"
+            echo "ClientAliveCountMax 3"
+            echo "MaxAuthTries 3"
+            echo "MaxSessions 10"
+            echo "LoginGraceTime 60"
+            echo "AllowTcpForwarding yes"
+            echo "GatewayPorts no"
+            echo "PermitTunnel no"
+            echo "X11Forwarding no"
+            echo "AllowAgentForwarding no"
+        } > "$_ssh_tmp"
+        chmod 600 "$_ssh_tmp"
+        if ! mv -f "$_ssh_tmp" "$SSH_DROPIN_PATH"; then
+            rm -f "$_ssh_tmp"
+            red_msg "Failed to install $SSH_DROPIN_PATH."
+            return 1
+        fi
+    else
+        # Legacy mode: global keys ONLY above the first active Match block.
+        # set_sshd_opt matches/replaces within the global section; new keys
+        # are inserted before the Match line, never appended after it.
+        set_sshd_opt() {
+            local key="$1" val="$2" _at="" _g="" _t=""
+            _at=$(sshd_match_start "$SSH_PATH")
+            if [ -z "$_at" ]; then
+                if grep -qE "^[[:space:]]*${key}[[:space:]]+" "$SSH_PATH"; then
+                    sed -i -E "s|^[[:space:]]*${key}[[:space:]]+.*|${key} ${val}|" "$SSH_PATH"
+                else
+                    echo "${key} ${val}" >> "$SSH_PATH"
+                fi
+                return 0
+            fi
+            _g=$(mktemp) || return 1
+            _t=$(mktemp) || { rm -f "$_g"; return 1; }
+            OPT_TMPFILES+=("$_g" "$_t")
+            head -n $((_at - 1)) "$SSH_PATH" > "$_g"
+            tail -n +"$_at" "$SSH_PATH" > "$_t"
+            if grep -qE "^[[:space:]]*${key}[[:space:]]+" "$_g"; then
+                sed -i -E "s|^[[:space:]]*${key}[[:space:]]+.*|${key} ${val}|" "$_g"
+            else
+                printf '%s %s\n' "$key" "$val" >> "$_g"
+            fi
+            cat "$_g" "$_t" > "$SSH_PATH"
+            return 0
+        }
+
+        set_sshd_opt "UseDNS" "no"
+        set_sshd_opt "Compression" "no"
+        set_sshd_opt "TCPKeepAlive" "yes"
+        set_sshd_opt "ClientAliveInterval" "300"
+        set_sshd_opt "ClientAliveCountMax" "3"
+        set_sshd_opt "MaxAuthTries" "3"
+        set_sshd_opt "MaxSessions" "10"
+        set_sshd_opt "LoginGraceTime" "60"
+        set_sshd_opt "AllowTcpForwarding" "yes"
+        set_sshd_opt "GatewayPorts" "no"
+        set_sshd_opt "PermitTunnel" "no"
+        set_sshd_opt "X11Forwarding" "no"
+        set_sshd_opt "AllowAgentForwarding" "no"
+    fi
 
     # --- Runtime prerequisites (pristine/minimal cloud images) ---
     # 1. Privilege-separation directory: absent before the daemon ever
@@ -1311,6 +1813,49 @@ update_sshd_conf() {
     # Capture output: a bare 2>/dev/null hides WHY the test failed.
     local sshd_out=""
     if sshd_out=$(sshd -t 2>&1); then
+        # Effective-value check: confirm the daemon actually sees our managed
+        # values (catches Include-ordering surprises). A mismatch is a FAILURE:
+        # silently reporting success while another drop-in overrides our
+        # hardening would be dishonest. If sshd -T is unavailable the check is
+        # skipped; sshd -t already passed.
+        local _eff_out="" _eff_ok=1 _eff_key _eff_want _eff_got _eff_rest
+        if _eff_out=$(sshd -T 2>/dev/null); then
+            for _eff_key in usedns compression tcpkeepalive clientaliveinterval clientalivecountmax maxauthtries maxsessions logingracetime allowtcpforwarding gatewayports permittunnel x11forwarding allowagentforwarding; do
+                case "$_eff_key" in
+                    usedns) _eff_want="no" ;;
+                    compression) _eff_want="no" ;;
+                    tcpkeepalive) _eff_want="yes" ;;
+                    clientaliveinterval) _eff_want="300" ;;
+                    clientalivecountmax) _eff_want="3" ;;
+                    maxauthtries) _eff_want="3" ;;
+                    maxsessions) _eff_want="10" ;;
+                    logingracetime) _eff_want="60" ;;
+                    allowtcpforwarding) _eff_want="yes" ;;
+                    gatewayports) _eff_want="no" ;;
+                    permittunnel) _eff_want="no" ;;
+                    x11forwarding) _eff_want="no" ;;
+                    allowagentforwarding) _eff_want="no" ;;
+                esac
+                _eff_got=$(printf '%s\n' "$_eff_out" | awk -v k="$_eff_key" 'tolower($1)==k {$1=""; sub(/^ +/,""); print tolower($0); exit}')
+                if [ -z "$_eff_got" ]; then
+                    yellow_msg "sshd -T does not report '$_eff_key' on this OpenSSH version; skipping that check."
+                    continue
+                fi
+                if [ "$_eff_got" != "$_eff_want" ]; then
+                    red_msg "sshd effective value mismatch: $_eff_key is '$_eff_got', expected '$_eff_want' (another drop-in overrides ours)."
+                    _eff_ok=0
+                fi
+            done
+            if [ "$_eff_ok" = "1" ]; then
+                green_msg "sshd effective values verified (sshd -T matches managed settings)."
+            else
+                red_msg "SSH hardening NOT effective (overridden by earlier config). Rolling back to the exact pre-run state."
+                ssh_rollback
+                return 1
+            fi
+        else
+            yellow_msg "sshd -T unavailable for effective-value check (sshd -t passed; continuing)."
+        fi
         # reload keeps existing sessions alive; restart would drop yours.
         if systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null; then
             green_msg 'SSH is Optimized (reloaded, sessions preserved).'
@@ -1321,16 +1866,44 @@ update_sshd_conf() {
     else
         red_msg 'sshd -t failed:'
         printf '%s\n' "$sshd_out" >&2
-        red_msg 'Restoring backup to avoid lockout.'
-        local latest
-        latest=$(ls -1t "${SSH_PATH}".bak.* 2>/dev/null | head -n1)
-        if [ -n "$latest" ]; then
-            cp -p "$latest" "$SSH_PATH"
-            yellow_msg "Restored: $latest"
-        fi
+        red_msg 'Restoring exact pre-run state (NOT reloading).'
+        ssh_rollback
         return 1
     fi
     echo
+}
+
+# ssh_rollback: restore the EXACT pre-run sshd state captured in SSH_MAIN_SNAP
+# / SSH_DROPIN_SNAP. No "newest file" guessing. Verifies with sshd -t but
+# never reloads on failure.
+ssh_rollback() {
+    if [ "$SSH_USE_DROPIN" = "1" ]; then
+        if [ -n "${SSH_DROPIN_SNAP:-}" ] && [ -f "$SSH_DROPIN_SNAP" ]; then
+            cp -p "$SSH_DROPIN_SNAP" "$SSH_DROPIN_PATH"
+            yellow_msg "Restored drop-in from pre-run snapshot."
+        else
+            rm -f "$SSH_DROPIN_PATH"
+            yellow_msg "Removed new drop-in: $SSH_DROPIN_PATH (no pre-existing drop-in this run)."
+        fi
+        # A legacy 99- file removed earlier in this run is restored too, so a
+        # failed run leaves the on-disk drop-in set exactly as it found it.
+        if [ -n "${SSH_DROPIN_LEGACY_SNAP:-}" ] && [ -f "$SSH_DROPIN_LEGACY_SNAP" ] && [ ! -f "$SSH_DROPIN_LEGACY" ]; then
+            cp -p "$SSH_DROPIN_LEGACY_SNAP" "$SSH_DROPIN_LEGACY"
+            yellow_msg "Restored legacy drop-in from pre-run snapshot: $SSH_DROPIN_LEGACY"
+        fi
+    fi
+    if [ -n "${SSH_MAIN_SNAP:-}" ] && [ -f "$SSH_MAIN_SNAP" ]; then
+        cp -p "$SSH_MAIN_SNAP" "$SSH_PATH"
+        yellow_msg "Restored $SSH_PATH from pre-run snapshot."
+    else
+        red_msg "No pre-run snapshot available for $SSH_PATH; leaving current file untouched."
+    fi
+    if sshd -t >/dev/null 2>&1; then
+        green_msg "Rollback verified: restored SSH config passes sshd -t."
+    else
+        red_msg "WARNING: restored SSH config still fails sshd -t (pre-existing breakage?). NOT reloading; fix manually before restarting sshd."
+    fi
+    return 0
 }
 
 # System Limits Optimizations (finite values — unlimited nproc/memlock/core
@@ -1370,7 +1943,10 @@ limits_optimizations() {
         yellow_msg "Cleaning old optimizer ulimit entries from $PROF_PATH (preserving custom user entries)"
         backup_file "$PROF_PATH"
         local tmp_prof line trimmed skip
-        tmp_prof=$(mktemp)
+        tmp_prof=$(mktemp "$(dirname "$PROF_PATH")/.profile.linux-optimizer.XXXXXX") || {
+            red_msg "Failed to stage a temporary file for $PROF_PATH; leaving it untouched."
+            return 1
+        }
         OPT_TMPFILES+=("$tmp_prof")
         while IFS= read -r line || [ -n "$line" ]; do
             trimmed=$(printf '%s' "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
@@ -1387,7 +1963,22 @@ limits_optimizations() {
                 yellow_msg "Removed optimizer entry: $trimmed"
             fi
         done < "$PROF_PATH"
-        cat "$tmp_prof" > "$PROF_PATH"
+        # Atomic replacement: the staged file lives in the same directory
+        # (same filesystem), inherits the original permissions/ownership, and
+        # is moved into place. A crash can never leave $PROF_PATH truncated.
+        chmod --reference="$PROF_PATH" "$tmp_prof" 2>/dev/null || chmod 644 "$tmp_prof"
+        chown --reference="$PROF_PATH" "$tmp_prof" 2>/dev/null || true
+        if mv -f "$tmp_prof" "$PROF_PATH"; then
+            local _kept=() _t
+            for _t in "${OPT_TMPFILES[@]}"; do
+                [ "$_t" != "$tmp_prof" ] || continue
+                _kept+=("$_t")
+            done
+            OPT_TMPFILES=("${_kept[@]}")
+        else
+            red_msg "Failed to replace $PROF_PATH atomically; original left untouched."
+            return 1
+        fi
     else
         yellow_msg "No legacy optimizer ulimit entries in $PROF_PATH, leaving custom entries untouched"
     fi
@@ -1469,17 +2060,19 @@ show_menu() {
     echo
 }
 
-# Apply Everything
+# Apply Everything (resilient: every stage runs, failures are recorded and
+# reported honestly by the caller via print_final_status)
 apply_everything() {
-    complete_update
-    disable_terminal_ads
-    installations
-    enable_packages
-    swap_maker
-    sysctl_optimizations "${OPT_PROFILE:-}"
-    remove_old_ssh_conf
-    update_sshd_conf
-    limits_optimizations
+    reset_failures
+    run_step "update" complete_update
+    run_step "terminal-ads" disable_terminal_ads
+    run_step "packages" installations
+    run_step "enable-packages" enable_packages
+    run_step "swap" swap_maker
+    run_step "network" sysctl_optimizations "${OPT_PROFILE:-}"
+    ssh_prep; run_step "ssh-clean" remove_old_ssh_conf
+    run_step "ssh" update_sshd_conf
+    run_step "limits" limits_optimizations
 }
 
 # Main Execution Loop
@@ -1494,101 +2087,82 @@ main() {
         case $choice in
         1)
             apply_everything
-            echo
-            green_msg '========================='
-            green_msg 'Done.'
-            green_msg '========================='
-            ask_reboot
+            print_final_status
+            ask_reboot_guarded
             ;;
         2)
-            complete_update
-            installations
-            enable_packages
-            swap_maker
-            sysctl_optimizations
-            remove_old_ssh_conf
-            update_sshd_conf
-            limits_optimizations
-            echo
-            green_msg '========================='
-            green_msg 'Done.'
-            green_msg '========================='
-            ask_reboot
+            reset_failures
+            run_step "update" complete_update
+            run_step "packages" installations
+            run_step "enable-packages" enable_packages
+            run_step "swap" swap_maker
+            run_step "network" sysctl_optimizations
+            ssh_prep; run_step "ssh-clean" remove_old_ssh_conf
+            run_step "ssh" update_sshd_conf
+            run_step "limits" limits_optimizations
+            print_final_status
+            ask_reboot_guarded
             ;;
         3)
-            complete_update
-            swap_maker
-            sysctl_optimizations
-            remove_old_ssh_conf
-            update_sshd_conf
-            limits_optimizations
-            echo
-            green_msg '========================='
-            green_msg 'Done.'
-            green_msg '========================='
-            ask_reboot
+            reset_failures
+            run_step "update" complete_update
+            run_step "swap" swap_maker
+            run_step "network" sysctl_optimizations
+            ssh_prep; run_step "ssh-clean" remove_old_ssh_conf
+            run_step "ssh" update_sshd_conf
+            run_step "limits" limits_optimizations
+            print_final_status
+            ask_reboot_guarded
             ;;
         4)
-            complete_update
-            echo
-            green_msg '========================='
-            green_msg 'Done.'
-            green_msg '========================='
-            ask_reboot
+            reset_failures
+            run_step "update" complete_update
+            print_final_status
+            ask_reboot_guarded
             ;;
         5)
             # FIX (was: complete_update + installations): the label says
             # "Install Useful Packages" so it installs packages ONLY.
             # A full OS upgrade behind option 5 was surprising and risky.
-            installations
-            enable_packages
-            echo
-            green_msg '========================='
-            green_msg 'Done.'
-            green_msg '========================='
-            ask_reboot
+            reset_failures
+            run_step "packages" installations
+            run_step "enable-packages" enable_packages
+            print_final_status
+            ask_reboot_guarded
             ;;
         6)
-            swap_maker
-            echo
-            green_msg '========================='
-            green_msg 'Done.'
-            green_msg '========================='
-            ask_reboot
+            reset_failures
+            run_step "swap" swap_maker
+            print_final_status
+            ask_reboot_guarded
             ;;
         7)
-            sysctl_optimizations
-            remove_old_ssh_conf
-            update_sshd_conf
-            limits_optimizations
-            echo
-            green_msg '========================='
-            green_msg 'Done.'
-            green_msg '========================='
-            ask_reboot
+            reset_failures
+            run_step "network" sysctl_optimizations
+            ssh_prep; run_step "ssh-clean" remove_old_ssh_conf
+            run_step "ssh" update_sshd_conf
+            run_step "limits" limits_optimizations
+            print_final_status
+            ask_reboot_guarded
             ;;
         8)
-            sysctl_optimizations
-            echo
-            green_msg '========================='
-            green_msg 'Done.'
-            green_msg '========================='
+            reset_failures
+            run_step "network" sysctl_optimizations
+            print_final_status
+            notify_reboot_if_required
             ;;
         9)
-            remove_old_ssh_conf
-            update_sshd_conf
-            echo
-            green_msg '========================='
-            green_msg 'Done.'
-            green_msg '========================='
+            reset_failures
+            ssh_prep; run_step "ssh-clean" remove_old_ssh_conf
+            run_step "ssh" update_sshd_conf
+            print_final_status
+            notify_reboot_if_required
             ;;
         10)
-            limits_optimizations
-            echo
-            green_msg '========================='
-            green_msg 'Done.'
-            green_msg '========================='
-            ask_reboot
+            reset_failures
+            run_step "limits" limits_optimizations
+            print_final_status
+            ask_reboot_guarded
             ;;
         q|Q)
             exit 0
@@ -1618,7 +2192,13 @@ parse_args() {
             --ssh) DO_SSH=1; shift ;;
             --limits) DO_LIMITS=1; shift ;;
             --profile)
-                OPT_PROFILE="${2:-}"; shift 2
+                # Guard BEFORE shifting: a missing value must error out, never
+                # leave $# unchanged (infinite loop) or eat the next option.
+                if [ $# -lt 2 ] || ! require_arg_value "--profile" "${2:-}"; then
+                    red_msg "Usage: --profile NAME (balanced | vpn-high-throughput | vpn-low-latency | conservative | auto)"
+                    exit 1
+                fi
+                OPT_PROFILE="$2"; shift 2
                 case "$OPT_PROFILE" in
                     balanced|vpn-high-throughput|vpn-low-latency|conservative|auto) ;;
                     *) red_msg "Invalid --profile: $OPT_PROFILE"; exit 1 ;;
@@ -1631,8 +2211,18 @@ parse_args() {
                 esac
                 ;;
             --swap-size)
-                SWAP_SIZE="${2:-}"; shift 2 ;;
-            --swap-size=*) SWAP_SIZE="${1#--swap-size=}"; shift ;;
+                # Same guard as --profile: missing value exits, never loops.
+                if [ $# -lt 2 ] || ! require_arg_value "--swap-size" "${2:-}"; then
+                    red_msg "Usage: --swap-size SIZE (e.g. 2G, 4096M)"
+                    exit 1
+                fi
+                SWAP_SIZE="$2"; shift 2
+                validate_swap_size "$SWAP_SIZE" || exit 1
+                ;;
+            --swap-size=*)
+                SWAP_SIZE="${1#--swap-size=}"; shift
+                validate_swap_size "$SWAP_SIZE" || exit 1
+                ;;
             balanced|vpn-high-throughput|vpn-low-latency|conservative|auto)
                 OPT_PROFILE="$1"; shift ;;
             *)
@@ -1645,26 +2235,36 @@ check_if_running_as_root
 check_supported_os
 parse_args "$@"
 
+# Concurrency protection: never let two instances interleave system edits.
+acquire_lock || exit 1
+
 if [ "$DO_ALL" = "1" ]; then
     apply_everything
-    green_msg '========================='
-    green_msg 'Done.'
-    green_msg '========================='
-    ask_reboot
-    exit 0
+    if print_final_status; then
+        ask_reboot
+        exit 0
+    else
+        ask_reboot_guarded
+        exit 1
+    fi
 fi
 
 if [ "$DO_UPDATE$DO_PACKAGES$DO_SWAP$DO_NETWORK$DO_SSH$DO_LIMITS" != "000000" ]; then
-    [ "$DO_UPDATE" = "1" ] && complete_update
-    if [ "$DO_PACKAGES" = "1" ]; then installations; enable_packages; fi
-    [ "$DO_SWAP" = "1" ] && swap_maker
-    [ "$DO_NETWORK" = "1" ] && sysctl_optimizations "$OPT_PROFILE"
-    if [ "$DO_SSH" = "1" ]; then remove_old_ssh_conf; update_sshd_conf; fi
-    [ "$DO_LIMITS" = "1" ] && limits_optimizations
-    green_msg '========================='
-    green_msg 'Done.'
-    green_msg '========================='
-    exit 0
+    reset_failures
+    [ "$DO_UPDATE" = "1" ] && run_step "update" complete_update
+    if [ "$DO_PACKAGES" = "1" ]; then run_step "packages" installations; run_step "enable-packages" enable_packages; fi
+    [ "$DO_SWAP" = "1" ] && run_step "swap" swap_maker
+    [ "$DO_NETWORK" = "1" ] && run_step "network" sysctl_optimizations "$OPT_PROFILE"
+    if [ "$DO_SSH" = "1" ]; then ssh_prep; run_step "ssh-clean" remove_old_ssh_conf; run_step "ssh" update_sshd_conf; fi
+    [ "$DO_LIMITS" = "1" ] && run_step "limits" limits_optimizations
+    # Selective runs never prompt: surface a pending reboot without forcing one.
+    if print_final_status; then
+        notify_reboot_if_required
+        exit 0
+    else
+        notify_reboot_if_required
+        exit 1
+    fi
 fi
 
 main
