@@ -2027,7 +2027,7 @@ optimizer_checksum_for_os() {
 }
 
 optimizer_url_for_os() {
-    local base="https://raw.githubusercontent.com/KanekiDevPro/Linux-Optimizer/${OPT_OPTIMIZER_REF}/scripts"
+    local base="https://raw.githubusercontent.com/KanekiDevPro/Linux-Optimizer-NEW/${OPT_OPTIMIZER_REF}/scripts"
     case "$1" in
         ubuntu)           printf '%s/ubuntu-optimizer.sh' "$base" ;;
         debian)           printf '%s/debian-optimizer.sh' "$base" ;;
