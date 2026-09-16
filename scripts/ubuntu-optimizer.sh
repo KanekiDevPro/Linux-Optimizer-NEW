@@ -544,6 +544,58 @@ swap_entry_active() {
     grep -vE '^[[:space:]]*(#|$)' /etc/fstab 2>/dev/null | grep -qF "$1"
 }
 
+# swap_verify_staged <file>: confirm a staged replacement is a real, complete
+# swap area before the live swap is touched. mkswap exit status already gates
+# the build, but a truncated/foreign file that somehow reaches this point must
+# not trigger swapoff of the working swap.
+swap_verify_staged() {
+    local f="$1"
+    [ -f "$f" ] || return 1
+    [ -s "$f" ] || return 1
+    if command -v blkid >/dev/null 2>&1; then
+        blkid -t TYPE=swap -c /dev/null "$f" >/dev/null 2>&1 && return 0
+    fi
+    # Fallback without blkid(8): mkswap stamps "SWAPSPACE2"/"SWAP-SPACE" at a
+    # fixed magic offset near the end of the first page.
+    if command -v dd >/dev/null 2>&1 && command -v grep >/dev/null 2>&1; then
+        dd if="$f" bs=1 skip=4086 count=10 2>/dev/null | grep -q "SWAP" && return 0
+    fi
+    return 1
+}
+
+# swap_restore_after_failed_replace <prev> <had_active> <fstab_prev>:
+# best-effort recovery once the live swap has been turned off and a later
+# step (mv / swapon / fstab) failed. The previous state was snapshotted
+# before swapoff (old file kept as .prev, fstab line captured), so: put the
+# known-good file back at $SWAP_PATH, reactivate it when it was active, and
+# restore the previous fstab line when missing. Returns 0 when the previous
+# swap is usable again, 1 otherwise (the caller returns failure either way).
+swap_restore_after_failed_replace() {
+    local prev="$1" had_active="$2" fstab_prev="$3"
+    local rc=1
+    if [ -n "$prev" ] && [ -f "$prev" ] && [ ! -f "$SWAP_PATH" ]; then
+        mv -f "$prev" "$SWAP_PATH" 2>/dev/null || cp -p "$prev" "$SWAP_PATH" 2>/dev/null || true
+        rm -f "$prev" 2>/dev/null
+    elif [ -n "$prev" ] && [ -f "$prev" ] && [ -f "$SWAP_PATH" ]; then
+        rm -f "$prev" 2>/dev/null
+    fi
+    if [ "$had_active" = "1" ] && [ -f "$SWAP_PATH" ]; then
+        if swapon "$SWAP_PATH" 2>/dev/null; then
+            if grep -qs "^${SWAP_PATH}[[:space:]]" /proc/swaps; then
+                rc=0
+            fi
+        fi
+    elif [ "$had_active" != "1" ]; then
+        rc=0
+    fi
+    if [ -n "${fstab_prev:-}" ] && [ -f /etc/fstab ]; then
+        if ! swap_entry_active "$SWAP_PATH"; then
+            printf '%s\n' "$fstab_prev" >> /etc/fstab 2>/dev/null || true
+        fi
+    fi
+    return "$rc"
+}
+
 # swap_build_file <target> [dd]: allocate + mkswap a swap file WITHOUT
 # activating it. Sets SWAP_BUILT_WITH to "fallocate" or "dd". Never touches
 # the live swap or fstab; safe to run against a staging path.
@@ -664,40 +716,126 @@ swap_maker() {
     fi
 
     if [ "${SWAP_REPLACE:-0}" = "1" ]; then
-        # Safe recreate: stage at $SWAP_PATH.new, mkswap it, and only then
-        # swapoff the old file + move the new one into place. A failure here
-        # leaves the old working swap untouched (never worse than before).
-        if ! swap_build_file "${SWAP_PATH}.new"; then
+        # Failure-safe replacement transaction:
+        #   1. stage + mkswap + verify the replacement at $SWAP_PATH.new
+        #      while the old swap stays live;
+        #   2. snapshot the previous state (old file kept as $SWAP_PATH.prev
+        #      + previous fstab line) BEFORE swapoff;
+        #   3. only then swapoff / install / swapon;
+        #   4. any post-swapoff failure restores the previous file, tries to
+        #      reactivate it, and restores the previous fstab state, so the
+        #      machine is never left with no active swap, no valid
+        #      replacement, and no recoverable fstab entry.
+        # NOTE on path semantics: the active swap is registered under the
+        # $SWAP_PATH pathname, so replacing that path while it is still
+        # active would pull it out from under a live swap area (and a later
+        # swapon of the .new path plus swapoff of $SWAP_PATH would juggle
+        # two identities with fstab pointing at the wrong one). The old
+        # file is therefore renamed to .prev first and the staged file is
+        # moved into the canonical $SWAP_PATH pathname only while the old
+        # swap is off.
+        local _new="${SWAP_PATH}.new" _prev="${SWAP_PATH}.prev"
+        local _had_active=1 _fstab_prev=""
+        rm -f "$_prev" 2>/dev/null
+        if ! swap_build_file "$_new"; then
             red_msg "Replacement swap preparation failed; keeping the existing working swap at $SWAP_PATH."
-            rm -f "${SWAP_PATH}.new"
+            rm -f "$_new"
             return 1
         fi
-        yellow_msg "Replacement swap prepared; switching over..."
+        if ! swap_verify_staged "$_new"; then
+            red_msg "Staged replacement at $_new failed validation; keeping the existing working swap at $SWAP_PATH."
+            rm -f "$_new"
+            return 1
+        fi
+        # Activation probe of the STAGED file only: filesystems that accept
+        # fallocate but reject swapon ("swapfile has holes") are detected
+        # here, while the old swap is still live. On rejection, rebuild
+        # staged with dd (real blocks), then re-mkswap (inside the build)
+        # and re-verify before proceeding. No two-swap juggling: the probe
+        # is immediately deactivated and the old swap is never touched.
+        if [ "${SWAP_BUILT_WITH:-}" = "fallocate" ]; then
+            if swapon "$_new" 2>/dev/null; then
+                swapoff "$_new" 2>/dev/null || true
+            else
+                yellow_msg "Staged fallocate file rejected for activation (likely holes); rebuilding staged replacement with dd..."
+                rm -f "$_new"
+                if ! swap_build_file "$_new" dd; then
+                    red_msg "Replacement swap rebuild via dd failed; keeping the existing working swap at $SWAP_PATH."
+                    rm -f "$_new"
+                    return 1
+                fi
+                if ! swap_verify_staged "$_new"; then
+                    red_msg "Rebuilt replacement at $_new failed validation; keeping the existing working swap at $SWAP_PATH."
+                    rm -f "$_new"
+                    return 1
+                fi
+            fi
+        fi
+        grep -qs "^${SWAP_PATH}[[:space:]]" /proc/swaps || _had_active=0
+        _fstab_prev=$(grep -vE '^[[:space:]]*(#|$)' /etc/fstab 2>/dev/null | grep -F "$SWAP_PATH" | head -n 1 || true)
+        yellow_msg "Replacement swap prepared and verified; switching over..."
         if ! swapoff "$SWAP_PATH" 2>/dev/null; then
             red_msg "Failed to swapoff $SWAP_PATH - keeping existing swap; discarding replacement."
-            rm -f "${SWAP_PATH}.new"
+            rm -f "$_new"
             return 1
         fi
-        rm -f "$SWAP_PATH"
-        if ! mv -f "${SWAP_PATH}.new" "$SWAP_PATH"; then
-            red_msg "Failed to install replacement swap; trying to re-enable previous state."
-            swapon "$SWAP_PATH" 2>/dev/null || true
-            rm -f "${SWAP_PATH}.new"
+        if ! mv -f "$SWAP_PATH" "$_prev"; then
+            red_msg "Failed to stage the previous swap aside; attempting recovery of the previous state."
+            if swapon "$SWAP_PATH" 2>/dev/null && grep -qs "^${SWAP_PATH}[[:space:]]" /proc/swaps; then
+                yellow_msg "Previous swap reactivated at $SWAP_PATH."
+            else
+                red_msg "SWAP replacement FAILED and the previous swap could not be reactivated. Previous file state preserved; check dmesg."
+            fi
+            rm -f "$_new"
+            return 1
+        fi
+        if ! mv -f "$_new" "$SWAP_PATH"; then
+            red_msg "Failed to install replacement swap; restoring the previous swap state."
+            if swap_restore_after_failed_replace "$_prev" "$_had_active" "$_fstab_prev"; then
+                yellow_msg "Previous swap state restored at $SWAP_PATH."
+            else
+                red_msg "SWAP replacement FAILED and the previous swap could not be reactivated. Check dmesg."
+            fi
+            rm -f "$_new"
             return 1
         fi
         chmod 600 "$SWAP_PATH"
         if ! swapon "$SWAP_PATH" 2>/dev/null; then
-            red_msg "swapon of the replacement failed; old swap was already off. Check dmesg."
+            red_msg "swapon of the replacement failed; restoring the previous swap state."
+            rm -f "$SWAP_PATH" 2>/dev/null
+            if swap_restore_after_failed_replace "$_prev" "$_had_active" "$_fstab_prev"; then
+                yellow_msg "Previous swap state restored at $SWAP_PATH."
+            else
+                red_msg "SWAP replacement FAILED and the previous swap could not be reactivated. Check dmesg."
+            fi
             return 1
         fi
         if ! swap_entry_active "$SWAP_PATH"; then
             backup_file /etc/fstab
-            echo "$SWAP_PATH   none    swap    sw,nofail    0   0" >> /etc/fstab
+            if ! echo "$SWAP_PATH   none    swap    sw,nofail    0   0" >> /etc/fstab; then
+                red_msg "Replacement is active but the fstab entry could not be written; restoring the previous swap state."
+                swapoff "$SWAP_PATH" 2>/dev/null || true
+                rm -f "$SWAP_PATH" 2>/dev/null
+                if swap_restore_after_failed_replace "$_prev" "$_had_active" "$_fstab_prev"; then
+                    yellow_msg "Previous swap state restored at $SWAP_PATH."
+                else
+                    red_msg "SWAP replacement FAILED and the previous swap could not be reactivated. Check dmesg."
+                fi
+                return 1
+            fi
         fi
         if grep -qs "^${SWAP_PATH}[[:space:]]" /proc/swaps; then
+            rm -f "$_prev" 2>/dev/null
             green_msg "SWAP Recreated & Activated Successfully."
         else
-            red_msg "SWAP recreation verification failed"
+            red_msg "SWAP recreation verification failed; restoring the previous swap state."
+            swapoff "$SWAP_PATH" 2>/dev/null || true
+            rm -f "$SWAP_PATH" 2>/dev/null
+            if swap_restore_after_failed_replace "$_prev" "$_had_active" "$_fstab_prev"; then
+                yellow_msg "Previous swap state restored at $SWAP_PATH."
+            else
+                red_msg "SWAP replacement FAILED and the previous swap could not be reactivated. Check dmesg."
+            fi
             return 1
         fi
         echo
@@ -711,18 +849,43 @@ swap_maker() {
 
     if swap_entry_active "$SWAP_PATH"; then
         yellow_msg "Removing old fstab entry for $SWAP_PATH"
-        backup_file /etc/fstab
+        backup_file /etc/fstab || { red_msg "Failed to back up /etc/fstab; leaving it untouched."; return 1; }
         # Delete only ACTIVE (non-comment, non-blank) lines referencing the
         # path; documentation comments mentioning it are preserved. awk keeps
         # this readable where a negated-address sed gets fragile.
-        awk -v p="$SWAP_PATH" '($0 ~ /^[[:space:]]*(#|$)/) {print; next} index($0, p) == 0 {print}' /etc/fstab > /etc/fstab.optnew \
-            && cat /etc/fstab.optnew > /etc/fstab && rm -f /etc/fstab.optnew
+        # Atomic replacement: the staged file lives in the same directory
+        # (same filesystem), inherits the original permissions/ownership, and
+        # is moved into place. A crash can never leave /etc/fstab truncated.
+        _fstab_tmp=$(mktemp /etc/.fstab.linux-optimizer.XXXXXX) || {
+            red_msg "Failed to stage a temporary file for /etc/fstab; leaving it untouched."
+            return 1
+        }
+        if ! awk -v p="$SWAP_PATH" '($0 ~ /^[[:space:]]*(#|$)/) {print; next} index($0, p) == 0 {print}' /etc/fstab > "$_fstab_tmp"; then
+            red_msg "Failed to stage the fstab update; original left untouched."
+            rm -f "$_fstab_tmp" 2>/dev/null
+            return 1
+        fi
+        chmod --reference=/etc/fstab "$_fstab_tmp" 2>/dev/null || {
+            red_msg "Failed to preserve permissions on the staged fstab; original left untouched."
+            rm -f "$_fstab_tmp" 2>/dev/null
+            return 1
+        }
+        chown --reference=/etc/fstab "$_fstab_tmp" 2>/dev/null || {
+            red_msg "Failed to preserve ownership on the staged fstab; original left untouched."
+            rm -f "$_fstab_tmp" 2>/dev/null
+            return 1
+        }
+        if ! mv -f "$_fstab_tmp" /etc/fstab; then
+            red_msg "Failed to replace /etc/fstab atomically; original left untouched."
+            rm -f "$_fstab_tmp" 2>/dev/null
+            return 1
+        fi
     elif grep -qF "$SWAP_PATH" /etc/fstab; then
         # Commented/stale mention only: leave documentation comments alone.
         yellow_msg "fstab mentions $SWAP_PATH only in non-active form; leaving it untouched."
     fi
 
-    local swap_dir avail_mb swap_mb
+    local swap_dir avail_mb swap_mb _fstab_tmp=""
     swap_dir=$(dirname "$SWAP_PATH")
     [ -d "$swap_dir" ] || swap_dir="/"
     avail_mb=$(df -m --output=avail "$swap_dir" 2>/dev/null | tail -n1 | tr -d ' ')
@@ -1740,10 +1903,14 @@ update_sshd_conf() {
     if [ "$SSH_USE_DROPIN" = "1" ]; then
         yellow_msg "sshd uses Include; managing $SSH_DROPIN_PATH instead of touching $SSH_PATH."
         if [ -f "$SSH_DROPIN_LEGACY" ] && [ "$SSH_DROPIN_LEGACY" != "$SSH_DROPIN_PATH" ]; then
-            yellow_msg "Removing legacy optimizer drop-in $SSH_DROPIN_LEGACY (superseded by $SSH_DROPIN_PATH)."
-            backup_file "$SSH_DROPIN_LEGACY" >/dev/null 2>&1 || true
-            SSH_DROPIN_LEGACY_SNAP="$BACKUP_LAST"
-            rm -f "$SSH_DROPIN_LEGACY"
+            if grep -q "Managed by Linux-Optimize" "$SSH_DROPIN_LEGACY" 2>/dev/null; then
+                yellow_msg "Removing legacy optimizer drop-in $SSH_DROPIN_LEGACY (superseded by $SSH_DROPIN_PATH)."
+                backup_file "$SSH_DROPIN_LEGACY" >/dev/null 2>&1 || true
+                SSH_DROPIN_LEGACY_SNAP="$BACKUP_LAST"
+                rm -f "$SSH_DROPIN_LEGACY"
+            else
+                yellow_msg "Leaving $SSH_DROPIN_LEGACY untouched: no optimizer-managed marker found (administrator-owned?)."
+            fi
         fi
         if [ -f "$SSH_DROPIN_PATH" ]; then
             backup_file "$SSH_DROPIN_PATH" >/dev/null 2>&1 || true
@@ -1762,9 +1929,10 @@ update_sshd_conf() {
     #  MaxAuthTries/MaxSessions/LoginGraceTime - brute-force/DoS surface
     if [ "$SSH_USE_DROPIN" = "1" ]; then
         # Deterministic full-file write: re-running produces the same file.
-        local _ssh_tmp
+        local _ssh_tmp _sshd_opt_failed=0
         _ssh_tmp=$(mktemp "$(dirname "$SSH_DROPIN_PATH")/.00-optimizer.XXXXXX") || {
             red_msg "Failed to stage the sshd drop-in."
+            ssh_rollback
             return 1
         }
         OPT_TMPFILES+=("$_ssh_tmp")
@@ -1789,6 +1957,7 @@ update_sshd_conf() {
         if ! mv -f "$_ssh_tmp" "$SSH_DROPIN_PATH"; then
             rm -f "$_ssh_tmp"
             red_msg "Failed to install $SSH_DROPIN_PATH."
+            ssh_rollback
             return 1
         fi
     else
@@ -1820,19 +1989,25 @@ update_sshd_conf() {
             return 0
         }
 
-        set_sshd_opt "UseDNS" "no"
-        set_sshd_opt "Compression" "no"
-        set_sshd_opt "TCPKeepAlive" "yes"
-        set_sshd_opt "ClientAliveInterval" "300"
-        set_sshd_opt "ClientAliveCountMax" "3"
-        set_sshd_opt "MaxAuthTries" "3"
-        set_sshd_opt "MaxSessions" "10"
-        set_sshd_opt "LoginGraceTime" "60"
-        set_sshd_opt "AllowTcpForwarding" "yes"
-        set_sshd_opt "GatewayPorts" "no"
-        set_sshd_opt "PermitTunnel" "no"
-        set_sshd_opt "X11Forwarding" "no"
-        set_sshd_opt "AllowAgentForwarding" "no"
+        _sshd_opt_failed=0
+        set_sshd_opt "UseDNS" "no" || _sshd_opt_failed=1
+        set_sshd_opt "Compression" "no" || _sshd_opt_failed=1
+        set_sshd_opt "TCPKeepAlive" "yes" || _sshd_opt_failed=1
+        set_sshd_opt "ClientAliveInterval" "300" || _sshd_opt_failed=1
+        set_sshd_opt "ClientAliveCountMax" "3" || _sshd_opt_failed=1
+        set_sshd_opt "MaxAuthTries" "3" || _sshd_opt_failed=1
+        set_sshd_opt "MaxSessions" "10" || _sshd_opt_failed=1
+        set_sshd_opt "LoginGraceTime" "60" || _sshd_opt_failed=1
+        set_sshd_opt "AllowTcpForwarding" "yes" || _sshd_opt_failed=1
+        set_sshd_opt "GatewayPorts" "no" || _sshd_opt_failed=1
+        set_sshd_opt "PermitTunnel" "no" || _sshd_opt_failed=1
+        set_sshd_opt "X11Forwarding" "no" || _sshd_opt_failed=1
+        set_sshd_opt "AllowAgentForwarding" "no" || _sshd_opt_failed=1
+        if [ "$_sshd_opt_failed" = "1" ]; then
+            red_msg "Failed to write managed SSH keys; restoring the exact pre-run state."
+            ssh_rollback
+            return 1
+        fi
     fi
 
     # --- Runtime prerequisites (pristine/minimal cloud images) ---
@@ -1893,12 +2068,16 @@ update_sshd_conf() {
         else
             yellow_msg "sshd -T unavailable for effective-value check (sshd -t passed; continuing)."
         fi
-        # reload keeps existing sessions alive; restart would drop yours.
+        # reload keeps existing sessions alive; restart would drop yours,
+        # so a failed reload never triggers a restart here. But an
+        # unconfirmed reload is NOT success: record the failure so the
+        # final banner stays honest and reboot gating sees this stage.
         if systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null; then
             green_msg 'SSH is Optimized (reloaded, sessions preserved).'
         else
-            yellow_msg 'sshd -t passed but reload unsupported/failed; config saved, will apply on next restart. NOT restarting automatically to protect your session.'
+            red_msg 'sshd -t passed but reload failed/unsupported; config saved, NOT active yet. NOT restarting automatically to protect your session.'
             yellow_msg 'Apply manually when ready: systemctl restart ssh'
+            return 1
         fi
     else
         red_msg 'sshd -t failed:'
@@ -1978,7 +2157,10 @@ limits_optimizations() {
     done
     if [ "$found_optimizer_entry" = true ]; then
         yellow_msg "Cleaning old optimizer ulimit entries from $PROF_PATH (preserving custom user entries)"
-        backup_file "$PROF_PATH"
+        if ! backup_file "$PROF_PATH"; then
+            red_msg "Failed to back up $PROF_PATH; leaving it untouched."
+            return 1
+        fi
         local tmp_prof line trimmed skip
         tmp_prof=$(mktemp "$(dirname "$PROF_PATH")/.profile.linux-optimizer.XXXXXX") || {
             red_msg "Failed to stage a temporary file for $PROF_PATH; leaving it untouched."
@@ -2020,7 +2202,13 @@ limits_optimizations() {
         yellow_msg "No legacy optimizer ulimit entries in $PROF_PATH, leaving custom entries untouched"
     fi
 
-    cat > "$LIMITS_CONF" <<'EOF'
+    local _limits_tmp=""
+    _limits_tmp=$(mktemp "$(dirname "$LIMITS_CONF")/.99-optimizer.XXXXXX") || {
+        red_msg "Failed to stage a temporary file for $LIMITS_CONF; leaving it untouched."
+        return 1
+    }
+    OPT_TMPFILES+=("$_limits_tmp")
+    cat > "$_limits_tmp" <<'EOF'
 # /etc/security/limits.d/99-optimizer.conf - managed by Linux-Optimize.
 # Finite values on purpose: 'unlimited' nproc/memlock/core = fork-bomb /
 # RAM-lock / disk-fill DoS by any single user. Re-running the script
@@ -2038,33 +2226,107 @@ root            hard    nofile          1048576
 *               soft    stack           32768
 *               hard    stack           65536
 EOF
-    chmod 644 "$LIMITS_CONF"
+    if [ "$?" -ne 0 ]; then
+        red_msg "Failed to write managed limits file $LIMITS_CONF."
+        rm -f "$_limits_tmp" 2>/dev/null
+        return 1
+    fi
+    # Atomic replacement: the staged file lives in the same directory
+    # (same filesystem) and is moved into place, so a crash can never
+    # leave $LIMITS_CONF partially written. Content is deterministic
+    # (identical on rerun), preserving idempotency.
+    if ! chmod 644 "$_limits_tmp"; then
+        red_msg "Failed to set permissions on managed limits file $LIMITS_CONF."
+        rm -f "$_limits_tmp" 2>/dev/null
+        return 1
+    fi
+    if ! mv -f "$_limits_tmp" "$LIMITS_CONF"; then
+        red_msg "Failed to install managed limits file $LIMITS_CONF; original left untouched."
+        rm -f "$_limits_tmp" 2>/dev/null
+        return 1
+    fi
+    { local _kept=() _t
+      for _t in "${OPT_TMPFILES[@]}"; do
+          [ "$_t" != "$_limits_tmp" ] || continue
+          _kept+=("$_t")
+      done
+      OPT_TMPFILES=("${_kept[@]}"); }
 
-    local conf
+    local conf _sysd_tmp=""
+    local limits_systemd_failed=0
     for conf in /etc/systemd/system.conf /etc/systemd/user.conf; do
         if [ -f "$conf" ]; then
             if ! grep -q "^DefaultLimitNOFILE=1048576" "$conf" \
                 || grep -q "^DefaultLimitNPROC=infinity" "$conf" \
                 || grep -q "^DefaultLimitMEMLOCK=infinity" "$conf"; then
-                backup_file "$conf"
-                sed -i '/^DefaultLimitNOFILE/d; /^DefaultLimitNPROC/d; /^DefaultLimitMEMLOCK/d' "$conf"
-                {
+                backup_file "$conf" || { red_msg "Failed to back up $conf; leaving it untouched."; limits_systemd_failed=1; continue; }
+                # Stage-then-replace: sed-delete + append runs against a
+                # same-directory temp file, which is validated (complete,
+                # non-empty, carries all three managed keys exactly once)
+                # before the atomic mv. A crash can never leave $conf
+                # half-rewritten. Values unchanged.
+                _sysd_tmp=$(mktemp "$(dirname "$conf")/.systemd.linux-optimizer.XXXXXX") || {
+                    red_msg "Failed to stage a temporary file for $conf; leaving it untouched."
+                    limits_systemd_failed=1
+                    continue
+                }
+                if ! sed -e '/^DefaultLimitNOFILE/d; /^DefaultLimitNPROC/d; /^DefaultLimitMEMLOCK/d' "$conf" > "$_sysd_tmp"; then
+                    red_msg "Failed to stage managed limits update for $conf."
+                    rm -f "$_sysd_tmp" 2>/dev/null
+                    limits_systemd_failed=1
+                    continue
+                fi
+                if ! {
                     echo "DefaultLimitNOFILE=1048576"
                     echo "DefaultLimitNPROC=65536"
                     echo "DefaultLimitMEMLOCK=1073741824"
-                } >> "$conf"
+                } >> "$_sysd_tmp"; then
+                    red_msg "Failed to write managed limits to $conf."
+                    rm -f "$_sysd_tmp" 2>/dev/null
+                    limits_systemd_failed=1
+                    continue
+                fi
+                if [ ! -s "$_sysd_tmp" ] \
+                    || [ "$(grep -c "^DefaultLimitNOFILE=1048576" "$_sysd_tmp")" != "1" ] \
+                    || [ "$(grep -c "^DefaultLimitNPROC=65536" "$_sysd_tmp")" != "1" ] \
+                    || [ "$(grep -c "^DefaultLimitMEMLOCK=1073741824" "$_sysd_tmp")" != "1" ]; then
+                    red_msg "Staged systemd update for $conf failed validation; original left untouched."
+                    rm -f "$_sysd_tmp" 2>/dev/null
+                    limits_systemd_failed=1
+                    continue
+                fi
+                chmod --reference="$conf" "$_sysd_tmp" 2>/dev/null || chmod 644 "$_sysd_tmp"
+                chown --reference="$conf" "$_sysd_tmp" 2>/dev/null || true
+                if ! mv -f "$_sysd_tmp" "$conf"; then
+                    red_msg "Failed to replace $conf atomically; original left untouched."
+                    rm -f "$_sysd_tmp" 2>/dev/null
+                    limits_systemd_failed=1
+                    continue
+                fi
                 yellow_msg "Updated $conf (finite limits; needs daemon-reexec + reboot for PID 1)"
             fi
         fi
     done
+    if [ "$limits_systemd_failed" = "1" ]; then
+        red_msg "System Limits optimization FAILED (systemd configuration)."
+        return 1
+    fi
 
     local pam
+    local limits_pam_failed=0
     for pam in /etc/pam.d/common-session /etc/pam.d/common-session-noninteractive; do
         if [ -f "$pam" ] && ! grep -q "pam_limits.so" "$pam"; then
-            backup_file "$pam"
-            echo "session required pam_limits.so" >> "$pam"
+            backup_file "$pam" || { red_msg "Failed to back up $pam; leaving it untouched."; limits_pam_failed=1; continue; }
+            if ! echo "session required pam_limits.so" >> "$pam"; then
+                red_msg "Failed to enable pam_limits in $pam."
+                limits_pam_failed=1
+            fi
         fi
     done
+    if [ "$limits_pam_failed" = "1" ]; then
+        red_msg "System Limits optimization FAILED (PAM configuration)."
+        return 1
+    fi
 
     ulimit -n 1048576 2>/dev/null || ulimit -n 65536 2>/dev/null || true
     systemctl daemon-reload 2>/dev/null || true
@@ -2267,6 +2529,19 @@ parse_args() {
         esac
     done
 }
+
+# Privilege-independent help: --help/-h must work for any user on any OS
+# without the lock or any system modification. Detect the help-only
+# invocation BEFORE root/OS/lock initialization; every other command keeps
+# the normal privileged validation below. The loop mirrors the -h|--help
+# arm of parse_args so the two can never drift (both must stay exact-match
+# on `-h` / `--help` only).
+for _opt_help in "$@"; do
+    case "$_opt_help" in
+        -h|--help) print_help; exit 0 ;;
+    esac
+done
+unset _opt_help
 
 check_if_running_as_root
 check_supported_os
