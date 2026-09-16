@@ -1416,7 +1416,10 @@ configure_netplan_dns() {
         cp "$NETPLAN_DNS_FILE" "$NETPLAN_BAK_FILE" || NETPLAN_BAK_FILE=""
     fi
 
-    printf '%s\n' "$new_content" > "$NETPLAN_DNS_FILE" || return 0
+    if ! printf '%s\n' "$new_content" > "$NETPLAN_DNS_FILE"; then
+        red_msg "Could not write $NETPLAN_DNS_FILE."
+        return 0
+    fi
     chmod 600 "$NETPLAN_DNS_FILE"
     NETPLAN_FILE_CREATED=1
 
@@ -1490,7 +1493,7 @@ apply_dns_networkmanager() {
     nm_apply_dns_to_profiles
 
     if [ "$NM_APPLIED" = "1" ]; then
-        if grep -q "nameserver ${DNS_V4%% *}" /etc/resolv.conf 2>/dev/null || resolv_conf_is_resolved_stub; then
+        if grep -Eq "^nameserver ${DNS_V4%% *}[[:space:]]*\$" /etc/resolv.conf 2>/dev/null || resolv_conf_is_resolved_stub; then
             persist_dns_state
             return 0
         fi
@@ -1585,7 +1588,7 @@ verify_dns() {
     yellow_msg "DNS verification..."
     command -v resolvectl >/dev/null 2>&1 && resolvectl flush-caches >/dev/null 2>&1
 
-    local effective via rc
+    local via rc effective
     effective=$(dedup_list "$(get_effective_dns 2>/dev/null | tr '\n' ' ')")
     plain_msg "Effective DNS: ${effective:-(none visible yet)}"
 
@@ -1732,6 +1735,16 @@ bootstrap_dns_if_needed() {
     return 0
 }
 
+bootstrap_restore_immutable() {
+    # Restore the chattr +i flag that resolvconf_writable() removed, on every
+    # failure path of the bootstrap, so the host is never left unprotected.
+    if [ "$RESOLV_WAS_IMMUTABLE" = "1" ] && command -v chattr >/dev/null 2>&1; then
+        chattr +i /etc/resolv.conf 2>/dev/null || true
+        RESOLV_WAS_IMMUTABLE=0
+    fi
+    return 0
+}
+
 bootstrap_dns_apply() {
     resolvconf_writable || return 1
 
@@ -1741,11 +1754,18 @@ bootstrap_dns_apply() {
     fi
     BS_BAK="/etc/resolv.conf.pre-bootstrap.$TS"
     if [ -e /etc/resolv.conf ]; then
-        cp -L /etc/resolv.conf "$BS_BAK" 2>/dev/null || true
+        if ! cp -L /etc/resolv.conf "$BS_BAK" 2>/dev/null; then
+            red_msg "Could not back up /etc/resolv.conf; refusing the temporary resolver."
+            bootstrap_restore_immutable
+            return 1
+        fi
     fi
 
     local tmp ns n=0
-    tmp=$(mktemp /etc/.resolv.conf.linux-optimizer.XXXXXX) || return 1
+    tmp=$(mktemp /etc/.resolv.conf.linux-optimizer.XXXXXX) || {
+        bootstrap_restore_immutable
+        return 1
+    }
     {
         printf '# Temporary resolver installed by Linux-Optimizer (%s)\n' "$TS"
         for ns in $BS_LIST; do
@@ -1754,11 +1774,18 @@ bootstrap_dns_apply() {
             printf 'nameserver %s\n' "$ns"
         done
         resolv_extra_directives "$BS_BAK"
-    } > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    } > "$tmp" 2>/dev/null || { rm -f "$tmp"; bootstrap_restore_immutable; return 1; }
 
     chmod 644 "$tmp"
     [ -L /etc/resolv.conf ] && rm -f /etc/resolv.conf
-    mv -f "$tmp" /etc/resolv.conf || { rm -f "$tmp"; return 1; }
+    if ! mv -f "$tmp" /etc/resolv.conf; then
+        if [ -f "$BS_BAK" ]; then
+            cp "$BS_BAK" /etc/resolv.conf 2>/dev/null || true
+        fi
+        rm -f "$tmp"
+        bootstrap_restore_immutable
+        return 1
+    fi
     BS_APPLIED=1
     return 0
 }
@@ -1967,9 +1994,12 @@ geo_lookup() {
         [ -n "$tz" ] && { printf '%s %s' "$tz" "$cc"; return 0; }
     else
         out=$(curl -s --max-time 8 "http://ip-api.com/line/$ip?fields=timezone,countryCode" 2>/dev/null | tr -d '\r') || out=""
-        tz=$(printf '%s\n' "$out" | sed -n 1p)
-        cc=$(printf '%s\n' "$out" | sed -n 2p)
-        [ -n "$tz" ] && { printf '%s %s' "$tz" "$cc"; return 0; }
+        tz=$(printf '%s\n' "$out" | sed -n '1p')
+        cc=$(printf '%s\n' "$out" | sed -n '2p')
+        if [ -n "$tz" ] && valid_tz "$tz" && [[ "$cc" =~ ^[A-Za-z]{2}$ ]]; then
+            printf '%s %s' "$tz" "${cc^^}"
+            return 0
+        fi
     fi
     return 1
 }
@@ -2026,7 +2056,12 @@ set_timezone() {
     fi
 
     current=$(timedatectl show -p Timezone --value 2>/dev/null) || current=""
-    [ -n "$current" ] || current=$(cat /etc/timezone 2>/dev/null) || current=""
+
+    if [ -z "$current" ]; then
+        local current_tz=""
+        current_tz=$(cat /etc/timezone 2>/dev/null) || current_tz=""
+        [ -n "$current_tz" ] && current="$current_tz"
+    fi
     red_msg "Timezone auto-detect failed. Current timezone left unchanged: ${current:-unknown}"
     yellow_msg "Set it manually with: timedatectl set-timezone Asia/Tehran   (or --timezone=Asia/Tehran)"
     return 1
