@@ -181,8 +181,45 @@ acquire_lock() {
 }
 
 release_lock() {
+    # Never release a lock owned by the parent loader: when this process
+    # runs as the loader's child, the parent remains the lock owner for
+    # the whole execution (see inherited_parent_lock below).
+    if [ "${LINUX_OPTIMIZER_CHILD_INHERITED_LOCK:-0}" = "1" ]; then
+        return 0
+    fi
     [ -n "${OPT_LOCK_DIR:-}" ] && [ -d "$OPT_LOCK_DIR" ] && rmdir "$OPT_LOCK_DIR" 2>/dev/null
     return 0
+}
+
+# inherited_parent_lock: succeed only when this process was launched by the
+# parent loader AND carries proof that the parent still owns the global
+# optimizer lock. The LINUX_OPTIMIZER_LOCK_HELD=1 marker is an internal
+# parent-to-child contract and is NOT trusted on its own: it must be
+# accompanied by matching inherited lock state, otherwise a stray
+# `LINUX_OPTIMIZER_LOCK_HELD=1 bash ubuntu-optimizer.sh` from a normal
+# shell falls through to acquire_lock and keeps standalone safety intact.
+#   * flock mode: FD 9 must be open (the parent keeps its `exec 9>>lock`
+#     descriptor open across `bash child`, so an open FD 9 proves the
+#     parent's flock is still held by an ancestor of this process).
+#   * mkdir mode: the parent-owned lock directory named by the marker must
+#     exist (the parent's mkdir fallback lock, which only the parent may
+#     remove via its own cleanup).
+inherited_parent_lock() {
+    [ "${LINUX_OPTIMIZER_LOCK_HELD:-0}" = "1" ] || return 1
+    local mode="${LINUX_OPTIMIZER_LOCK_MODE:-flock}"
+    if [ "$mode" = "mkdir" ]; then
+        [ -n "${LINUX_OPTIMIZER_PARENT_LOCK_DIR:-}" ] || return 1
+        [ -d "$LINUX_OPTIMIZER_PARENT_LOCK_DIR" ] || return 1
+        return 0
+    fi
+    # flock mode (default): require an open FD 9 inherited from the parent.
+    # `: >&9` succeeds iff FD 9 is open for writing in this process; a
+    # closed FD 9 (normal standalone execution, or a spoofed env var from
+    # a shell without the lock) fails and we fall back to acquire_lock.
+    if : >&9 2>/dev/null; then
+        return 0
+    fi
+    return 1
 }
 
 # --- Logging ------------------------------------------------------------------
@@ -2236,7 +2273,16 @@ check_supported_os
 parse_args "$@"
 
 # Concurrency protection: never let two instances interleave system edits.
-acquire_lock || exit 1
+if inherited_parent_lock; then
+    # Parent loader already owns the global optimizer lock and keeps it
+    # held for this whole child execution: skip a second acquisition of
+    # the same lock (which would deadlock against the parent). The
+    # parent stays responsible for releasing it; release_lock above is a
+    # no-op in this mode so our EXIT trap cannot drop the parent's lock.
+    LINUX_OPTIMIZER_CHILD_INHERITED_LOCK=1
+else
+    acquire_lock || exit 1
+fi
 
 if [ "$DO_ALL" = "1" ]; then
     apply_everything
