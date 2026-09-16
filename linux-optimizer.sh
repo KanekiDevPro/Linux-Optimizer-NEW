@@ -159,17 +159,23 @@ _pick_lock_path() {
 
 LOCK_FILE=$(_pick_lock_path)
 LOCK_DIR="${LOCK_FILE}.d"
+LINUX_OPTIMIZER_LOCK_MODE=""
+LINUX_OPTIMIZER_PARENT_LOCK_DIR=""
 if command -v flock >/dev/null 2>&1; then
     exec 9>>"$LOCK_FILE"
     if ! flock -n 9; then
         red_msg "Another instance is running (lock: $LOCK_FILE). Exiting."
         exit 72
     fi
+    LINUX_OPTIMIZER_LOCK_MODE="flock"
 elif ! mkdir "$LOCK_DIR" 2>/dev/null; then
     # Atomic fallback for minimal systems without flock(1): mkdir is atomic,
     # so exactly one instance wins the lock.
     red_msg "Another instance is running (lock: $LOCK_DIR). Exiting."
     exit 72
+else
+    LINUX_OPTIMIZER_LOCK_MODE="mkdir"
+    LINUX_OPTIMIZER_PARENT_LOCK_DIR="$LOCK_DIR"
 fi
 
 # ---------------------------------------------------------------------------
@@ -2082,8 +2088,19 @@ run_optimizer_file() {
     local f="$1" rc=0
     prepare_sshd_runtime_dir
     chmod +x "$f" 2>/dev/null || true
-    # 9>&- keeps the instance lock out of the child process.
-    bash "$f" 9>&-
+    # Parent-to-child lock handoff: the parent already owns the global
+    # optimizer lock and keeps it for the whole child execution, so the
+    # child must NOT attempt a second acquisition of the same lock (that
+    # would deadlock against the parent). FD 9 stays open so the flock
+    # lock remains held AND inherited as proof of ownership; the exported
+    # marker tells the child which mechanism owns the lock. The marker
+    # alone is never trusted by the child without the matching inherited
+    # state (open FD 9 for flock, existing parent lock dir for mkdir).
+    LINUX_OPTIMIZER_LOCK_HELD=1 \
+    LINUX_OPTIMIZER_LOCK_MODE="$LINUX_OPTIMIZER_LOCK_MODE" \
+    LINUX_OPTIMIZER_LOCK_FILE="$LOCK_FILE" \
+    LINUX_OPTIMIZER_PARENT_LOCK_DIR="${LINUX_OPTIMIZER_PARENT_LOCK_DIR:-$LOCK_DIR}" \
+        bash "$f"
     rc=$?
     if [ "$rc" -ne 0 ]; then
         red_msg "The optimizer script exited with status $rc."
